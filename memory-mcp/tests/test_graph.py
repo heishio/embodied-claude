@@ -149,9 +149,9 @@ async def test_consolidate_prunes_weak_edges(graph: MemoryGraph):
         verbs=["歩く"],
         nouns_per_step=[["海", "砂"]],
     )
-    # nn edges start at 0.05, decay * 0.8 each cycle
+    # nn edges start at 0.05, decay * 0.98 each cycle
     # After enough cycles, should be pruned below 0.01
-    for _ in range(20):
+    for _ in range(300):
         await graph.consolidate()
 
     neighbors = await graph.query_neighbors("noun", "海")
@@ -194,3 +194,106 @@ async def test_consolidate_returns_stats(graph: MemoryGraph):
     assert "graph_pruned" in stats
     assert "graph_remaining" in stats
     assert stats["graph_decayed"] > 0
+
+
+# ── Category tests ─────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_create_category(graph: MemoryGraph):
+    """create_category creates a category and returns its ID."""
+    cat_id = await graph.create_category("テスト")
+    assert isinstance(cat_id, int)
+    assert cat_id > 0
+
+
+@pytest.mark.asyncio
+async def test_create_child_category(graph: MemoryGraph):
+    """Child categories reference their parent."""
+    parent_id = await graph.create_category("会話")
+    child_id = await graph.create_category("シオとの会話", parent_id=parent_id)
+    assert child_id != parent_id
+
+    cats = await graph.list_categories()
+    child = next(c for c in cats if c["id"] == child_id)
+    assert child["parent_id"] == parent_id
+
+
+@pytest.mark.asyncio
+async def test_list_categories(graph: MemoryGraph):
+    """list_categories returns all categories."""
+    await graph.create_category("A")
+    await graph.create_category("B")
+    cats = await graph.list_categories()
+    names = {c["name"] for c in cats}
+    assert "A" in names
+    assert "B" in names
+
+
+@pytest.mark.asyncio
+async def test_assign_node_category(graph: MemoryGraph):
+    """Nodes can be assigned to categories."""
+    await graph.register_chain(verbs=["見る"], nouns_per_step=[["空"]])
+    cat_id = await graph.create_category("自然")
+    await graph.assign_chain_nodes_to_category(["見る"], [["空"]], cat_id)
+
+    node_ids = await graph.get_category_node_ids(cat_id)
+    assert len(node_ids) == 2  # verb:見る + noun:空
+
+
+@pytest.mark.asyncio
+async def test_query_neighbors_with_category_filter(graph: MemoryGraph):
+    """query_neighbors with category_id only returns nodes in that category."""
+    # Two chains: one categorized, one not
+    await graph.register_chain(verbs=["見る"], nouns_per_step=[["空", "雲"]])
+    await graph.register_chain(verbs=["見る"], nouns_per_step=[["海"]])
+
+    cat_id = await graph.create_category("空の話")
+    # Only assign 空 and 雲 to the category
+    await graph.assign_chain_nodes_to_category(["見る"], [["空", "雲"]], cat_id)
+
+    # Filtered: should only see 空 and 雲 (not 海)
+    filtered = await graph.query_neighbors("verb", "見る", category_id=cat_id)
+    filtered_forms = {sf for _, sf, _ in filtered}
+    assert "空" in filtered_forms
+    assert "雲" in filtered_forms
+    assert "海" not in filtered_forms
+
+    # Unfiltered: should see all three
+    unfiltered = await graph.query_neighbors("verb", "見る")
+    unfiltered_forms = {sf for _, sf, _ in unfiltered}
+    assert "海" in unfiltered_forms
+
+
+@pytest.mark.asyncio
+async def test_recursive_category_includes_children(graph: MemoryGraph):
+    """Parent category filter includes nodes from child categories."""
+    await graph.register_chain(
+        verbs=["見る", "話す"],
+        nouns_per_step=[["空"], ["シオ"]],
+    )
+
+    parent_id = await graph.create_category("全体")
+    child_id = await graph.create_category("子カテゴリ", parent_id=parent_id)
+
+    # Assign nodes to the child category
+    await graph.assign_chain_nodes_to_category(["見る", "話す"], [["空"], ["シオ"]], child_id)
+
+    # Query with parent category should include child's nodes
+    parent_node_ids = await graph.get_category_node_ids(parent_id)
+    child_node_ids = await graph.get_category_node_ids(child_id)
+    assert parent_node_ids == child_node_ids  # parent includes child's nodes
+
+    # query_neighbors with parent category should work
+    neighbors = await graph.query_neighbors("verb", "見る", category_id=parent_id)
+    neighbor_forms = {sf for _, sf, _ in neighbors}
+    assert "空" in neighbor_forms
+
+
+@pytest.mark.asyncio
+async def test_uncategorized_nodes_visible_without_filter(graph: MemoryGraph):
+    """Nodes without category are visible when no filter is applied."""
+    await graph.register_chain(verbs=["走る"], nouns_per_step=[["道"]])
+    # Don't assign any category
+    neighbors = await graph.query_neighbors("verb", "走る")
+    assert any(sf == "道" for _, sf, _ in neighbors)

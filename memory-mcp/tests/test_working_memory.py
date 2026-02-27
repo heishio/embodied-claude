@@ -21,7 +21,7 @@ class TestWorkingMemoryBasic:
             id="1",
             content="First memory",
             timestamp=datetime.now(timezone.utc).isoformat(),
-            emotion="neutral",
+            emotion="8",
             importance=3,
             category="daily",
         )
@@ -29,7 +29,7 @@ class TestWorkingMemoryBasic:
             id="2",
             content="Second memory",
             timestamp=datetime.now(timezone.utc).isoformat(),
-            emotion="happy",
+            emotion="1",
             importance=4,
             category="daily",
         )
@@ -37,7 +37,7 @@ class TestWorkingMemoryBasic:
             id="3",
             content="Third memory",
             timestamp=datetime.now(timezone.utc).isoformat(),
-            emotion="excited",
+            emotion="5",
             importance=5,
             category="observation",
         )
@@ -62,7 +62,7 @@ class TestWorkingMemoryBasic:
             id="1",
             content="Memory 1",
             timestamp=datetime.now(timezone.utc).isoformat(),
-            emotion="neutral",
+            emotion="8",
             importance=3,
             category="daily",
         )
@@ -70,7 +70,7 @@ class TestWorkingMemoryBasic:
             id="2",
             content="Memory 2",
             timestamp=datetime.now(timezone.utc).isoformat(),
-            emotion="neutral",
+            emotion="8",
             importance=3,
             category="daily",
         )
@@ -95,7 +95,7 @@ class TestWorkingMemoryBasic:
                 id=str(i),
                 content=f"Memory {i}",
                 timestamp=datetime.now(timezone.utc).isoformat(),
-                emotion="neutral",
+                emotion="8",
                 importance=3,
                 category="daily",
             )
@@ -118,7 +118,7 @@ class TestWorkingMemoryBasic:
             id="1",
             content="Memory",
             timestamp=datetime.now(timezone.utc).isoformat(),
-            emotion="neutral",
+            emotion="8",
             importance=3,
             category="daily",
         )
@@ -143,7 +143,7 @@ class TestWorkingMemoryBasic:
             id="1",
             content="Memory",
             timestamp=datetime.now(timezone.utc).isoformat(),
-            emotion="neutral",
+            emotion="8",
             importance=3,
             category="daily",
         )
@@ -173,7 +173,7 @@ class TestWorkingMemoryEdgeCases:
             id="1",
             content="Memory",
             timestamp=datetime.now(timezone.utc).isoformat(),
-            emotion="neutral",
+            emotion="8",
             importance=3,
             category="daily",
         )

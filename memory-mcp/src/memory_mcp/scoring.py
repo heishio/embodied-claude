@@ -3,16 +3,15 @@
 import math
 from datetime import datetime, timezone
 
-# 感情ブーストマップ: 強い感情は記憶に残りやすい
 EMOTION_BOOST_MAP: dict[str, float] = {
-    "excited": 0.4,
-    "surprised": 0.35,
-    "moved": 0.3,
-    "sad": 0.25,
-    "happy": 0.2,
-    "nostalgic": 0.15,
-    "curious": 0.1,
-    "neutral": 0.0,
+    "5": 0.4,
+    "3": 0.35,
+    "4": 0.3,
+    "2": 0.25,
+    "1": 0.2,
+    "6": 0.15,
+    "7": 0.1,
+    "8": 0.0,
 }
 
 

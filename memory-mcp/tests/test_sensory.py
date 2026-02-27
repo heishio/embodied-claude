@@ -50,12 +50,12 @@ class TestVisualMemory:
             content="Found the morning sky",
             image_path="/tmp/wifi-cam/2026-02-01_07-53-00.jpg",
             camera_position=camera_pos,
-            emotion="excited",
+            emotion="5",
             importance=5,
         )
 
         assert memory.content == "Found the morning sky"
-        assert memory.emotion == "excited"
+        assert memory.emotion == "5"
         assert memory.importance == 5
         assert memory.category == "observation"
         assert memory.camera_position == camera_pos
@@ -89,12 +89,12 @@ class TestAudioMemory:
             content="Heard the childhood friend's voice",
             audio_path="/tmp/wifi-cam/2026-02-01_07-52-00.wav",
             transcript="こんにちは、今日はいい天気ですね",
-            emotion="happy",
+            emotion="1",
             importance=4,
         )
 
         assert memory.content == "Heard the childhood friend's voice"
-        assert memory.emotion == "happy"
+        assert memory.emotion == "1"
         assert memory.importance == 4
         assert len(memory.sensory_data) == 1
         assert memory.sensory_data[0].sensory_type == "audio"

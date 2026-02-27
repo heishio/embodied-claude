@@ -164,7 +164,7 @@ class TestEpisode:
             participants=("幼馴染",),
             location_context="Balcony",
             summary="Found the morning sky after searching",
-            emotion="excited",
+            emotion="5",
             importance=5,
         )
 
@@ -185,7 +185,7 @@ class TestEpisode:
             participants=("Alice", "Bob"),
             location_context="Room",
             summary="A test episode",
-            emotion="happy",
+            emotion="1",
             importance=4,
         )
 
@@ -197,7 +197,7 @@ class TestEpisode:
         assert metadata["memory_ids"] == "m1,m2"
         assert metadata["participants"] == "Alice,Bob"
         assert metadata["location_context"] == "Room"
-        assert metadata["emotion"] == "happy"
+        assert metadata["emotion"] == "1"
         assert metadata["importance"] == 4
 
     def test_episode_from_metadata(self):
@@ -209,7 +209,7 @@ class TestEpisode:
             "memory_ids": "m1,m2,m3",
             "participants": "User",
             "location_context": "Office",
-            "emotion": "curious",
+            "emotion": "7",
             "importance": 3,
         }
 
@@ -236,7 +236,7 @@ class TestEpisode:
             participants=(),
             location_context=None,
             summary="In progress",
-            emotion="neutral",
+            emotion="8",
             importance=3,
         )
 
@@ -258,7 +258,7 @@ class TestMemoryPhase4Fields:
             id="m1",
             content="Found the morning sky",
             timestamp=timestamp,
-            emotion="excited",
+            emotion="5",
             importance=5,
             category="observation",
             camera_position=camera_pos,
@@ -282,7 +282,7 @@ class TestMemoryPhase4Fields:
             id="m1",
             content="Captured the morning sky",
             timestamp=timestamp,
-            emotion="happy",
+            emotion="1",
             importance=4,
             category="observation",
             sensory_data=(sensory,),
@@ -299,7 +299,7 @@ class TestMemoryPhase4Fields:
             id="m1",
             content="Part of an episode",
             timestamp=timestamp,
-            emotion="neutral",
+            emotion="8",
             importance=3,
             category="daily",
             episode_id="ep1",
@@ -315,7 +315,7 @@ class TestMemoryPhase4Fields:
             id="m1",
             content="Tagged memory",
             timestamp=timestamp,
-            emotion="neutral",
+            emotion="8",
             importance=3,
             category="daily",
             tags=("important", "work", "deadline"),
@@ -340,7 +340,7 @@ class TestMemoryPhase4Fields:
             id="m1",
             content="Test memory",
             timestamp=timestamp,
-            emotion="happy",
+            emotion="1",
             importance=4,
             category="observation",
             episode_id="ep1",

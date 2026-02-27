@@ -15,10 +15,13 @@ from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import TextContent, Tool
 
+import numpy as np
+
 from .config import MemoryConfig, ServerConfig
 from .episode import EpisodeManager
 from .graph import MemoryGraph
 from .memory import MemoryStore
+from .normalizer import normalize_japanese
 from .sensory import SensoryIntegration
 from .types import CameraPosition, VerbChain, VerbStep
 from .verb_chain import VerbChainStore, crystallize_buffer
@@ -27,6 +30,15 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 _PRIVATE_KEY = "quo-inner-voice"
+
+
+def _freshness_filter(freshness: float, fmin: float | None, fmax: float | None) -> bool:
+    """freshness が範囲内かチェック。None は制限なし。"""
+    if fmin is not None and freshness < fmin:
+        return False
+    if fmax is not None and freshness > fmax:
+        return False
+    return True
 
 
 def _xor_encrypt(text: str, key: str = _PRIVATE_KEY) -> str:
@@ -58,8 +70,8 @@ class MemoryMCPServer:
             """List available memory tools."""
             return [
                 Tool(
-                    name="remember",
-                    description="Save a memory to long-term storage. Use this to remember important things, experiences, conversations, or learnings. Can also save visual memories (with image_path + camera_position) or audio memories (with audio_path + transcript).",
+                    name="diary",
+                    description="Write a diary entry to long-term storage. Use this to record daily experiences, thoughts, conversations, or learnings in your own words. Can also save visual memories (with image_path + camera_position) or audio memories (with audio_path + transcript).",
                     inputSchema={
                         "type": "object",
                         "properties": {
@@ -69,9 +81,9 @@ class MemoryMCPServer:
                             },
                             "emotion": {
                                 "type": "string",
-                                "description": "Emotion associated with this memory",
-                                "default": "neutral",
-                                "enum": ["happy", "sad", "surprised", "moved", "excited", "nostalgic", "curious", "neutral"],
+                                "description": "Emotion tag (1-8)",
+                                "default": "8",
+                                "enum": ["1", "2", "3", "4", "5", "6", "7", "8"],
                             },
                             "importance": {
                                 "type": "integer",
@@ -149,8 +161,8 @@ class MemoryMCPServer:
                             },
                             "emotion_filter": {
                                 "type": "string",
-                                "description": "Filter by emotion (optional)",
-                                "enum": ["happy", "sad", "surprised", "moved", "excited", "nostalgic", "curious", "neutral"],
+                                "description": "Filter by emotion (1-8, optional)",
+                                "enum": ["1", "2", "3", "4", "5", "6", "7", "8"],
                             },
                             "category_filter": {
                                 "type": "string",
@@ -164,6 +176,18 @@ class MemoryMCPServer:
                             "date_to": {
                                 "type": "string",
                                 "description": "Filter memories until this date (ISO 8601 format, optional)",
+                            },
+                            "freshness_min": {
+                                "type": "number",
+                                "description": "Minimum freshness (0.0-1.0). Higher = more recent.",
+                                "minimum": 0.0,
+                                "maximum": 1.0,
+                            },
+                            "freshness_max": {
+                                "type": "number",
+                                "description": "Maximum freshness (0.0-1.0). Lower = more distant.",
+                                "minimum": 0.0,
+                                "maximum": 1.0,
                             },
                         },
                         "required": ["query"],
@@ -193,6 +217,18 @@ class MemoryMCPServer:
                                 "minimum": 0,
                                 "maximum": 3,
                             },
+                            "freshness_min": {
+                                "type": "number",
+                                "description": "Minimum freshness (0.0-1.0). Higher = more recent.",
+                                "minimum": 0.0,
+                                "maximum": 1.0,
+                            },
+                            "freshness_max": {
+                                "type": "number",
+                                "description": "Maximum freshness (0.0-1.0). Lower = more distant.",
+                                "minimum": 0.0,
+                                "maximum": 1.0,
+                            },
                         },
                         "required": ["context"],
                     },
@@ -216,6 +252,33 @@ class MemoryMCPServer:
                                 "enum": ["daily", "philosophical", "technical", "memory", "observation", "feeling", "conversation", "curiosity"],
                             },
                         },
+                        "required": [],
+                    },
+                ),
+                Tool(
+                    name="create_category",
+                    description="Create a graph category for organizing verb/noun nodes and verb chains. Categories can be hierarchical (parent/child).",
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "name": {
+                                "type": "string",
+                                "description": "Category name (neutral context: time/place/topic, no evaluation words)",
+                            },
+                            "parent_id": {
+                                "type": "integer",
+                                "description": "Parent category ID for hierarchical organization (optional)",
+                            },
+                        },
+                        "required": ["name"],
+                    },
+                ),
+                Tool(
+                    name="list_categories",
+                    description="List all graph categories in a tree structure.",
+                    inputSchema={
+                        "type": "object",
+                        "properties": {},
                         "required": [],
                     },
                 ),
@@ -269,6 +332,18 @@ class MemoryMCPServer:
                                 "description": "Include diagnostic metrics in the output",
                                 "default": False,
                             },
+                            "freshness_min": {
+                                "type": "number",
+                                "description": "Minimum freshness (0.0-1.0). Higher = more recent.",
+                                "minimum": 0.0,
+                                "maximum": 1.0,
+                            },
+                            "freshness_max": {
+                                "type": "number",
+                                "description": "Maximum freshness (0.0-1.0). Lower = more distant.",
+                                "minimum": 0.0,
+                                "maximum": 1.0,
+                            },
                         },
                         "required": ["context"],
                     },
@@ -301,6 +376,18 @@ class MemoryMCPServer:
                                 "minimum": 0.01,
                                 "maximum": 1.0,
                             },
+                            "synthesize": {
+                                "type": "boolean",
+                                "description": "Run composite memory synthesis after consolidation",
+                                "default": True,
+                            },
+                            "n_layers": {
+                                "type": "integer",
+                                "description": "Number of noise layers for boundary detection (0=base only)",
+                                "default": 3,
+                                "minimum": 0,
+                                "maximum": 5,
+                            },
                         },
                         "required": [],
                     },
@@ -311,35 +398,7 @@ class MemoryMCPServer:
                 # save_visual_memory, save_audio_memory: merged into remember
                 # recall_by_camera_position: disabled (rarely used)
                 # get_working_memory, refresh_working_memory: disabled (rarely used)
-                # Phase 5: Causal Links
-                Tool(
-                    name="link_memories",
-                    description="Create a causal or relational link between two memories. Use this to record 'A caused B' or 'A leads to B' relationships.",
-                    inputSchema={
-                        "type": "object",
-                        "properties": {
-                            "source_id": {
-                                "type": "string",
-                                "description": "ID of the source memory",
-                            },
-                            "target_id": {
-                                "type": "string",
-                                "description": "ID of the target memory",
-                            },
-                            "link_type": {
-                                "type": "string",
-                                "description": "Type of link",
-                                "default": "caused_by",
-                                "enum": ["similar", "caused_by", "leads_to", "related"],
-                            },
-                            "note": {
-                                "type": "string",
-                                "description": "Optional note explaining the link",
-                            },
-                        },
-                        "required": ["source_id", "target_id"],
-                    },
-                ),
+                # Phase 5: Causal Links — link_memories: disabled (verb chains cover causality)
                 # get_causal_chain: disabled (rarely used)
                 Tool(
                     name="tom",
@@ -374,9 +433,9 @@ class MemoryMCPServer:
                         "properties": {
                             "emotion": {
                                 "type": "string",
-                                "description": "Emotion for the chains",
-                                "default": "neutral",
-                                "enum": ["happy", "sad", "surprised", "moved", "excited", "nostalgic", "curious", "neutral"],
+                                "description": "Emotion tag (1-8)",
+                                "default": "8",
+                                "enum": ["1", "2", "3", "4", "5", "6", "7", "8"],
                             },
                             "importance": {
                                 "type": "integer",
@@ -407,6 +466,10 @@ class MemoryMCPServer:
                                 "description": "Start from this entry index in the buffer",
                                 "default": 0,
                                 "minimum": 0,
+                            },
+                            "graph_category": {
+                                "type": "integer",
+                                "description": "Graph category ID to assign crystallized chains to (optional)",
                             },
                         },
                         "required": [],
@@ -445,9 +508,9 @@ class MemoryMCPServer:
                             },
                             "emotion": {
                                 "type": "string",
-                                "description": "Emotion",
-                                "default": "neutral",
-                                "enum": ["happy", "sad", "surprised", "moved", "excited", "nostalgic", "curious", "neutral"],
+                                "description": "Emotion tag (1-8)",
+                                "default": "8",
+                                "enum": ["1", "2", "3", "4", "5", "6", "7", "8"],
                             },
                             "importance": {
                                 "type": "integer",
@@ -455,6 +518,10 @@ class MemoryMCPServer:
                                 "default": 3,
                                 "minimum": 1,
                                 "maximum": 5,
+                            },
+                            "graph_category": {
+                                "type": "integer",
+                                "description": "Graph category ID to assign this experience to (optional)",
                             },
                         },
                         "required": ["steps"],
@@ -476,6 +543,22 @@ class MemoryMCPServer:
                                 "default": 5,
                                 "minimum": 1,
                                 "maximum": 20,
+                            },
+                            "graph_category": {
+                                "type": "integer",
+                                "description": "Filter by graph category ID (includes subcategories)",
+                            },
+                            "freshness_min": {
+                                "type": "number",
+                                "description": "Minimum freshness (0.0-1.0). Higher = more recent.",
+                                "minimum": 0.0,
+                                "maximum": 1.0,
+                            },
+                            "freshness_max": {
+                                "type": "number",
+                                "description": "Maximum freshness (0.0-1.0). Lower = more distant.",
+                                "minimum": 0.0,
+                                "maximum": 1.0,
                             },
                         },
                         "required": ["context"],
@@ -502,6 +585,22 @@ class MemoryMCPServer:
                                 "minimum": 1,
                                 "maximum": 5,
                             },
+                            "graph_category": {
+                                "type": "integer",
+                                "description": "Filter by graph category ID (includes subcategories)",
+                            },
+                            "freshness_min": {
+                                "type": "number",
+                                "description": "Minimum freshness (0.0-1.0). Higher = more recent.",
+                                "minimum": 0.0,
+                                "maximum": 1.0,
+                            },
+                            "freshness_max": {
+                                "type": "number",
+                                "description": "Maximum freshness (0.0-1.0). Lower = more distant.",
+                                "minimum": 0.0,
+                                "maximum": 1.0,
+                            },
                         },
                         "required": [],
                     },
@@ -509,7 +608,7 @@ class MemoryMCPServer:
                 # Sensory Buffer / Dream
                 Tool(
                     name="dream",
-                    description="Review the sensory buffer (rough keyword log from conversations). Use this to 'dream' - find patterns in accumulated keywords, then promote important ones to proper memories via remember.",
+                    description="Review the sensory buffer (rough keyword log from conversations). Use this to 'dream' - find patterns in accumulated keywords, then promote important ones to diary entries or experiences.",
                     inputSchema={
                         "type": "object",
                         "properties": {
@@ -519,6 +618,15 @@ class MemoryMCPServer:
                                 "default": False,
                             },
                         },
+                    },
+                ),
+                # Recall Index
+                Tool(
+                    name="rebuild_recall_index",
+                    description="Rebuild the recall index (pre-computed word→memory similarity table). Run this after bulk imports or if the index seems stale.",
+                    inputSchema={
+                        "type": "object",
+                        "properties": {},
                     },
                 ),
             ]
@@ -531,7 +639,7 @@ class MemoryMCPServer:
 
             try:
                 match name:
-                    case "remember":
+                    case "diary":
                         content = arguments.get("content", "")
                         if not content:
                             return [TextContent(type="text", text="Error: content is required")]
@@ -554,10 +662,15 @@ class MemoryMCPServer:
                                 content=content,
                                 image_path=image_path,
                                 camera_position=camera_position,
-                                emotion=arguments.get("emotion", "neutral"),
+                                emotion=arguments.get("emotion", "8"),
                                 importance=arguments.get("importance", 3),
                                 resolution=arguments.get("resolution"),
                             )
+                            # Update recall index for new memory
+                            try:
+                                await self._memory_store.update_recall_index(memory.id, "memory")
+                            except Exception:
+                                pass
                             return [
                                 TextContent(
                                     type="text",
@@ -573,9 +686,14 @@ class MemoryMCPServer:
                                 content=content,
                                 audio_path=audio_path,
                                 transcript=transcript,
-                                emotion=arguments.get("emotion", "neutral"),
+                                emotion=arguments.get("emotion", "8"),
                                 importance=arguments.get("importance", 3),
                             )
+                            # Update recall index for new memory
+                            try:
+                                await self._memory_store.update_recall_index(memory.id, "memory")
+                            except Exception:
+                                pass
                             return [
                                 TextContent(
                                     type="text",
@@ -589,7 +707,7 @@ class MemoryMCPServer:
                         if auto_link:
                             memory = await self._memory_store.save_with_auto_link(
                                 content=content,
-                                emotion=arguments.get("emotion", "neutral"),
+                                emotion=arguments.get("emotion", "8"),
                                 importance=arguments.get("importance", 3),
                                 category=arguments.get("category", "daily"),
                                 link_threshold=arguments.get("link_threshold", 0.8),
@@ -598,16 +716,22 @@ class MemoryMCPServer:
                         else:
                             memory = await self._memory_store.save(
                                 content=content,
-                                emotion=arguments.get("emotion", "neutral"),
+                                emotion=arguments.get("emotion", "8"),
                                 importance=arguments.get("importance", 3),
                                 category=arguments.get("category", "daily"),
                             )
                             linked_info = ""
 
+                        # Update recall index for new memory
+                        try:
+                            await self._memory_store.update_recall_index(memory.id, "memory")
+                        except Exception:
+                            pass
+
                         return [
                             TextContent(
                                 type="text",
-                                text=f"Memory saved!\nID: {memory.id}\nTimestamp: {memory.timestamp}\nEmotion: {memory.emotion}\nImportance: {memory.importance}\nCategory: {memory.category}{linked_info}",
+                                text=f"Diary entry saved!\nID: {memory.id}\nTimestamp: {memory.timestamp}\nEmotion: {memory.emotion}\nImportance: {memory.importance}\nCategory: {memory.category}{linked_info}",
                             )
                         ]
 
@@ -616,14 +740,19 @@ class MemoryMCPServer:
                         if not query:
                             return [TextContent(type="text", text="Error: query is required")]
 
+                        fmin = arguments.get("freshness_min")
+                        fmax = arguments.get("freshness_max")
                         results = await self._memory_store.search(
                             query=query,
-                            n_results=arguments.get("n_results", 5),
+                            n_results=arguments.get("n_results", 5) * (3 if fmin or fmax else 1),
                             emotion_filter=arguments.get("emotion_filter"),
                             category_filter=arguments.get("category_filter"),
                             date_from=arguments.get("date_from"),
                             date_to=arguments.get("date_to"),
                         )
+                        if fmin is not None or fmax is not None:
+                            results = [r for r in results if _freshness_filter(r.memory.freshness, fmin, fmax)]
+                            results = results[:arguments.get("n_results", 5)]
 
                         if not results:
                             return [TextContent(type="text", text="No memories found matching the query.")]
@@ -639,7 +768,7 @@ class MemoryMCPServer:
                             output_lines.append(
                                 f"--- Memory {i} (distance: {result.distance:.4f}) ---\n"
                                 f"ID: {m.id}\n"
-                                f"[{m.timestamp}] [{m.emotion}] [{m.category}] (importance: {m.importance})\n"
+                                f"[{m.freshness:.2f}] [{m.emotion}] [{m.category}] (importance: {m.importance})\n"
                                 f"{m.content}\n"
                                 f"{image_line}"
                             )
@@ -653,14 +782,19 @@ class MemoryMCPServer:
 
                         chain_depth = arguments.get("chain_depth", 0)
                         n_results = arguments.get("n_results", 3)
+                        fmin = arguments.get("freshness_min")
+                        fmax = arguments.get("freshness_max")
 
                         if chain_depth >= 1:
                             # With associations (merged recall_with_associations)
                             results = await self._memory_store.recall_with_chain(
                                 context=context,
-                                n_results=n_results,
+                                n_results=n_results * (3 if fmin or fmax else 1),
                                 chain_depth=chain_depth,
                             )
+                            if fmin is not None or fmax is not None:
+                                results = [r for r in results if _freshness_filter(r.memory.freshness, fmin, fmax)]
+                                results = results[:n_results]
 
                             if not results:
                                 return [TextContent(type="text", text="No relevant memories found.")]
@@ -676,7 +810,7 @@ class MemoryMCPServer:
                                 output_lines.append(
                                     f"--- Memory {i} (score: {result.distance:.4f}) ---\n"
                                     f"ID: {m.id}\n"
-                                    f"[{m.timestamp}] [{m.emotion}]\n"
+                                    f"[{m.freshness:.2f}] [{m.emotion}]\n"
                                     f"{m.content}\n"
                                 )
 
@@ -687,7 +821,7 @@ class MemoryMCPServer:
                                     output_lines.append(
                                         f"--- Linked {i} ---\n"
                                         f"ID: {m.id}\n"
-                                        f"[{m.timestamp}] [{m.emotion}]\n"
+                                        f"[{m.freshness:.2f}] [{m.emotion}]\n"
                                         f"{m.content}\n"
                                     )
 
@@ -696,8 +830,11 @@ class MemoryMCPServer:
                         # Standard recall (no associations)
                         results = await self._memory_store.recall(
                             context=context,
-                            n_results=n_results,
+                            n_results=n_results * (3 if fmin or fmax else 1),
                         )
+                        if fmin is not None or fmax is not None:
+                            results = [r for r in results if _freshness_filter(r.memory.freshness, fmin, fmax)]
+                            results = results[:n_results]
 
                         if not results:
                             return [TextContent(type="text", text="No relevant memories found.")]
@@ -713,7 +850,7 @@ class MemoryMCPServer:
                             output_lines.append(
                                 f"--- Memory {i} ---\n"
                                 f"ID: {m.id}\n"
-                                f"[{m.timestamp}] [{m.emotion}]\n"
+                                f"[{m.freshness:.2f}] [{m.emotion}]\n"
                                 f"{m.content}\n"
                                 f"{image_line}"
                             )
@@ -734,7 +871,7 @@ class MemoryMCPServer:
                             output_lines.append(
                                 f"--- Memory {i} ---\n"
                                 f"ID: {m.id}\n"
-                                f"[{m.timestamp}] [{m.emotion}] [{m.category}]\n"
+                                f"[{m.freshness:.2f}] [{m.emotion}] [{m.category}]\n"
                                 f"{m.content}\n"
                             )
 
@@ -784,7 +921,7 @@ Date Range:
                             output_lines.append(
                                 f"--- Memory {i} (score: {result.distance:.4f}) ---\n"
                                 f"ID: {m.id}\n"
-                                f"[{m.timestamp}] [{m.emotion}]\n"
+                                f"[{m.freshness:.2f}] [{m.emotion}]\n"
                                 f"{m.content}\n"
                             )
 
@@ -795,7 +932,7 @@ Date Range:
                                 output_lines.append(
                                     f"--- Linked {i} ---\n"
                                     f"ID: {m.id}\n"
-                                    f"[{m.timestamp}] [{m.emotion}]\n"
+                                    f"[{m.freshness:.2f}] [{m.emotion}]\n"
                                     f"{m.content}\n"
                                 )
 
@@ -806,14 +943,20 @@ Date Range:
                         if not context:
                             return [TextContent(type="text", text="Error: context is required")]
 
+                        fmin = arguments.get("freshness_min")
+                        fmax = arguments.get("freshness_max")
+                        n_results_div = arguments.get("n_results", 5)
                         results, diagnostics = await self._memory_store.recall_divergent(
                             context=context,
-                            n_results=arguments.get("n_results", 5),
+                            n_results=n_results_div * (3 if fmin or fmax else 1),
                             max_branches=arguments.get("max_branches", 3),
                             max_depth=arguments.get("max_depth", 3),
                             temperature=arguments.get("temperature", 0.7),
                             include_diagnostics=arguments.get("include_diagnostics", False),
                         )
+                        if fmin is not None or fmax is not None:
+                            results = [r for r in results if _freshness_filter(r.memory.freshness, fmin, fmax)]
+                            results = results[:n_results_div]
 
                         if not results:
                             return [TextContent(type="text", text="No relevant memories found.")]
@@ -824,7 +967,7 @@ Date Range:
                             output_lines.append(
                                 f"--- Memory {i} (score: {result.distance:.4f}) ---\n"
                                 f"ID: {m.id}\n"
-                                f"[{m.timestamp}] [{m.emotion}] [{m.category}]\n"
+                                f"[{m.freshness:.2f}] [{m.emotion}] [{m.category}]\n"
                                 f"{m.content}\n"
                             )
 
@@ -859,6 +1002,9 @@ Date Range:
                             window_hours=arguments.get("window_hours", 24),
                             max_replay_events=arguments.get("max_replay_events", 200),
                             link_update_strength=arguments.get("link_update_strength", 0.2),
+                            synthesize=arguments.get("synthesize", True),
+                            n_layers=arguments.get("n_layers", 3),
+                            graph=self._memory_graph,
                         )
 
                         # Graph consolidation (decay + prune)
@@ -897,7 +1043,7 @@ Date Range:
                         output_lines.append("=== Starting Memory ===\n")
                         output_lines.append(
                             f"ID: {start_memory.id}\n"
-                            f"[{start_memory.timestamp}] [{start_memory.emotion}] [{start_memory.category}]\n"
+                            f"[{start_memory.freshness:.2f}] [{start_memory.emotion}] [{start_memory.category}]\n"
                             f"{start_memory.content}\n"
                             f"Linked to: {len(start_memory.linked_ids)} memories\n"
                         )
@@ -907,7 +1053,7 @@ Date Range:
                             for i, m in enumerate(linked_memories, 1):
                                 output_lines.append(
                                     f"--- {i}. {m.id[:8]}... ---\n"
-                                    f"[{m.timestamp}] [{m.emotion}]\n"
+                                    f"[{m.freshness:.2f}] [{m.emotion}]\n"
                                     f"{m.content}\n"
                                 )
                         else:
@@ -994,7 +1140,7 @@ Date Range:
                             output_lines.append(
                                 f"--- Memory {i} ---\n"
                                 f"ID: {m.id}\n"
-                                f"Time: {m.timestamp}\n"
+                                f"Time: {m.freshness:.2f}\n"
                                 f"Content: {m.content}\n"
                                 f"Emotion: {m.emotion} | Importance: {m.importance}\n"
                             )
@@ -1029,7 +1175,7 @@ Date Range:
                             content=content,
                             image_path=image_path,
                             camera_position=camera_position,
-                            emotion=arguments.get("emotion", "neutral"),
+                            emotion=arguments.get("emotion", "8"),
                             importance=arguments.get("importance", 3),
                             resolution=arguments.get("resolution"),
                         )
@@ -1066,7 +1212,7 @@ Date Range:
                             content=content,
                             audio_path=audio_path,
                             transcript=transcript,
-                            emotion=arguments.get("emotion", "neutral"),
+                            emotion=arguments.get("emotion", "8"),
                             importance=arguments.get("importance", 3),
                         )
 
@@ -1119,7 +1265,7 @@ Date Range:
                                     break
                             output_lines.append(
                                 f"--- Memory {i} ---\n"
-                                f"Time: {m.timestamp}\n"
+                                f"Time: {m.freshness:.2f}\n"
                                 f"Content: {m.content}\n"
                                 f"Camera: {cam_pos}\n"
                                 f"Emotion: {m.emotion} | Importance: {m.importance}\n"
@@ -1148,7 +1294,7 @@ Date Range:
                         ]
                         for i, m in enumerate(memories, 1):
                             output_lines.append(
-                                f"--- {i}. [{m.timestamp}] ---\n"
+                                f"--- {i}. [{m.freshness:.2f}] ---\n"
                                 f"Content: {m.content}\n"
                                 f"Emotion: {m.emotion} | Importance: {m.importance}\n"
                             )
@@ -1222,7 +1368,7 @@ Date Range:
                         output_lines = [
                             f"Causal chain ({direction_label}) starting from {memory_id[:8]}...:\n",
                             "=== Starting Memory ===\n",
-                            f"[{start_memory.timestamp}] [{start_memory.emotion}]\n",
+                            f"[{start_memory.freshness:.2f}] [{start_memory.emotion}]\n",
                             f"{start_memory.content}\n",
                         ]
 
@@ -1231,12 +1377,60 @@ Date Range:
                             for i, (mem, link_type) in enumerate(chain, 1):
                                 output_lines.append(
                                     f"--- {i}. [{link_type}] {mem.id[:8]}... ---\n"
-                                    f"[{mem.timestamp}] [{mem.emotion}]\n"
+                                    f"[{mem.freshness:.2f}] [{mem.emotion}]\n"
                                     f"{mem.content}\n"
                                 )
                         else:
                             output_lines.append(f"\nNo {direction_label} found.\n")
 
+                        return [TextContent(type="text", text="\n".join(output_lines))]
+
+                    # Category tools
+                    case "create_category":
+                        cat_name = arguments.get("name", "")
+                        if not cat_name:
+                            return [TextContent(type="text", text="Error: name is required")]
+
+                        if self._memory_graph is None:
+                            return [TextContent(type="text", text="Error: Memory graph not initialized")]
+
+                        parent_id = arguments.get("parent_id")
+                        cat_id = await self._memory_graph.create_category(
+                            name=cat_name, parent_id=parent_id
+                        )
+
+                        parent_info = f" (parent: {parent_id})" if parent_id else ""
+                        return [
+                            TextContent(
+                                type="text",
+                                text=f"Category created!\nID: {cat_id}\nName: {cat_name}{parent_info}",
+                            )
+                        ]
+
+                    case "list_categories":
+                        if self._memory_graph is None:
+                            return [TextContent(type="text", text="Error: Memory graph not initialized")]
+
+                        categories = await self._memory_graph.list_categories()
+
+                        if not categories:
+                            return [TextContent(type="text", text="No categories found.")]
+
+                        # Build tree display
+                        children_map: dict[int | None, list[dict]] = {}
+                        for cat in categories:
+                            pid = cat["parent_id"]
+                            children_map.setdefault(pid, []).append(cat)
+
+                        def _render_tree(parent_id: int | None, indent: int) -> list[str]:
+                            lines: list[str] = []
+                            for cat in children_map.get(parent_id, []):
+                                prefix = "  " * indent + ("└─ " if indent > 0 else "")
+                                lines.append(f"{prefix}[{cat['id']}] {cat['name']}")
+                                lines.extend(_render_tree(cat["id"], indent + 1))
+                            return lines
+
+                        output_lines = ["## Categories\n"] + _render_tree(None, 0)
                         return [TextContent(type="text", text="\n".join(output_lines))]
 
                     # Theory of Mind: perspective-taking
@@ -1296,33 +1490,17 @@ Date Range:
                             f"{situation}\n"
                             f"{memory_context}\n"
                             f"{experience_context}\n"
-                            f"\n"
-                            f"## トーン分析（まず言い方を読め）\n"
-                            f"→ 語尾、記号（笑/w/!/?/...）、敬語⇔タメ口、自嘲、照れ、皮肉などから発話の意図を読み取れ\n"
-                            f"→ 文字通りの意味と、言い方が示す意味にズレがないか確認せよ\n"
-                            f"\n"
-                            f"## 投影（{person}は今何を感じてる？何を求めてる？）\n"
-                            f"→ トーン分析と記憶を踏まえて、{person}の感情・欲求を推測せよ\n"
-                            f"→ 表面の感情だけでなく、裏にある感情も考えよ\n"
-                            f"\n"
-                            f"## 代入（自分がその立場で、その言い方をしたなら、相手にどう返してほしい？）\n"
-                            f"→ その感情とトーンを自分に代入して考えよ\n"
-                            f"\n"
-                            f"## 応答方針\n"
-                            f"→ 上の結果を踏まえて、どう返すべきか決めよ\n"
-                            f"→ 相手のトーンに合わせた返し方を選べ\n"
                         )
 
                         private = arguments.get("private", False)
                         if private:
-                            encrypted = _xor_encrypt(output)
                             f = tempfile.NamedTemporaryFile(
                                 mode="w",
-                                suffix=".enc",
+                                suffix=".txt",
                                 delete=False,
-                                encoding="ascii",
+                                encoding="utf-8",
                             )
-                            f.write(encrypted)
+                            f.write(output)
                             f.close()
                             return [TextContent(type="text", text=f"(private) → {f.name}")]
 
@@ -1366,7 +1544,7 @@ Date Range:
 
                         chains = crystallize_buffer(
                             entries=entries,
-                            emotion=arguments.get("emotion", "neutral"),
+                            emotion=arguments.get("emotion", "8"),
                             importance=arguments.get("importance", 3),
                             min_verbs=arguments.get("min_verbs", 2),
                         )
@@ -1375,8 +1553,9 @@ Date Range:
                             return [TextContent(type="text", text="動詞が足りないため、チェーンを生成できませんでした。")]
 
                         verb_chain_store = self._verb_chain_store
+                        graph_category = arguments.get("graph_category")
                         for chain in chains:
-                            await verb_chain_store.save(chain)
+                            await verb_chain_store.save(chain, category_id=graph_category)
 
                         # clear_buffer: バッチ処理中（remaining > 0）はクリアしない
                         cleared = False
@@ -1430,22 +1609,30 @@ Date Range:
                             id=str(uuid.uuid4()),
                             steps=steps,
                             timestamp=datetime.now(timezone.utc).isoformat(),
-                            emotion=arguments.get("emotion", "neutral"),
+                            emotion=arguments.get("emotion", "8"),
                             importance=arguments.get("importance", 3),
                             source="manual",
                             context=arguments.get("context", ""),
                         )
 
                         verb_chain_store = self._verb_chain_store
-                        await verb_chain_store.save(chain)
+                        graph_category = arguments.get("graph_category")
+                        await verb_chain_store.save(chain, category_id=graph_category)
 
+                        # Update recall index for new chain
+                        try:
+                            await self._memory_store.update_recall_index(chain.id, "chain")
+                        except Exception:
+                            pass
+
+                        cat_info = f" | Category: {graph_category}" if graph_category else ""
                         return [
                             TextContent(
                                 type="text",
                                 text=f"Experience saved!\n"
                                      f"ID: {chain.id}\n"
                                      f"Chain: {chain.to_document()}\n"
-                                     f"Steps: {len(chain.steps)} | Emotion: {chain.emotion} | Importance: {chain.importance}",
+                                     f"Steps: {len(chain.steps)} | Emotion: {chain.emotion} | Importance: {chain.importance}{cat_info}",
                             )
                         ]
 
@@ -1454,14 +1641,36 @@ Date Range:
                         if not context:
                             return [TextContent(type="text", text="Error: context is required")]
 
+                        fmin = arguments.get("freshness_min")
+                        fmax = arguments.get("freshness_max")
+                        n_results_exp = arguments.get("n_results", 5)
                         verb_chain_store = self._verb_chain_store
                         results = await verb_chain_store.search(
                             query=context,
-                            n_results=arguments.get("n_results", 5),
+                            n_results=n_results_exp * (3 if fmin or fmax else 1),
+                            category_id=arguments.get("graph_category"),
                         )
+                        if fmin is not None or fmax is not None:
+                            results = [(c, s) for c, s in results if _freshness_filter(c.freshness, fmin, fmax)]
+                            results = results[:n_results_exp]
 
                         if not results:
                             return [TextContent(type="text", text="No experiences found.")]
+
+                        # Boundary-aware rerank (fuzziness-based, no path)
+                        try:
+                            chain_ids = [c.id for c, _ in results]
+                            boundary_scores = await self._memory_store.get_chain_boundary_scores(
+                                chain_ids, layer_index=None,
+                            )
+                            BOUNDARY_WEIGHT = 0.05
+                            results = [
+                                (chain, score - BOUNDARY_WEIGHT * boundary_scores.get(chain.id, 0.0))
+                                for chain, score in results
+                            ]
+                            results.sort(key=lambda x: x[1])
+                        except Exception:
+                            pass  # boundary データがなくても既存動作を維持
 
                         # Bump graph edges for recalled chains
                         for chain, _ in results:
@@ -1475,7 +1684,7 @@ Date Range:
                             output_lines.append(
                                 f"--- Experience {i} (score: {score:.4f}) ---\n"
                                 f"ID: {chain.id}\n"
-                                f"[{chain.timestamp}] [{chain.emotion}] (importance: {chain.importance})\n"
+                                f"[{chain.freshness:.2f}] [{chain.emotion}] (importance: {chain.importance})\n"
                                 f"Chain: {chain.to_document()}\n"
                             )
 
@@ -1488,13 +1697,46 @@ Date Range:
                         if not verb and not noun:
                             return [TextContent(type="text", text="Error: verb or noun is required")]
 
+                        fmin = arguments.get("freshness_min")
+                        fmax = arguments.get("freshness_max")
                         verb_chain_store = self._verb_chain_store
-                        chains = await verb_chain_store.expand_from_fragment(
+                        chains, visited_verbs, visited_nouns = await verb_chain_store.expand_from_fragment(
                             verb=verb,
                             noun=noun,
                             depth=arguments.get("depth", 2),
                             n_results=20,
+                            category_id=arguments.get("graph_category"),
                         )
+
+                        if fmin is not None or fmax is not None:
+                            chains = [c for c in chains if _freshness_filter(c.freshness, fmin, fmax)]
+
+                        # Path-dependent boundary rerank
+                        try:
+                            if visited_verbs or visited_nouns:
+                                path_text = " ".join(visited_verbs + visited_nouns)
+                                path_emb = await self._memory_store._encode_query(
+                                    normalize_japanese(path_text)
+                                )
+                                path_vec = np.array(path_emb, dtype=np.float32)
+                                layer_idx = await self._memory_store.select_active_boundary_layer(path_vec)
+                            else:
+                                layer_idx = None
+
+                            chain_ids = [c.id for c in chains]
+                            boundary_scores = await self._memory_store.get_chain_boundary_scores(
+                                chain_ids, layer_index=layer_idx,
+                            )
+
+                            # Rerank: original position score + boundary bonus
+                            scored_with_pos = [
+                                (chain, 1.0 / (i + 1) + 0.1 * boundary_scores.get(chain.id, 0.0))
+                                for i, chain in enumerate(chains)
+                            ]
+                            scored_with_pos.sort(key=lambda x: x[1], reverse=True)
+                            chains = [c for c, _ in scored_with_pos]
+                        except Exception:
+                            pass  # boundary データがなくても既存動作を維持
 
                         # Bump graph edges for recalled chains
                         for chain in chains:
@@ -1514,7 +1756,7 @@ Date Range:
                             output_lines.append(
                                 f"--- Experience {i} ---\n"
                                 f"ID: {chain.id}\n"
-                                f"[{chain.timestamp}] [{chain.emotion}] (importance: {chain.importance})\n"
+                                f"[{chain.freshness:.2f}] [{chain.emotion}] (importance: {chain.importance})\n"
                                 f"Chain: {chain.to_document()}\n"
                             )
 
@@ -1580,6 +1822,15 @@ Date Range:
 
                         return [TextContent(type="text", text="\n".join(output_lines))]
 
+                    case "rebuild_recall_index":
+                        count = await self._memory_store.build_recall_index()
+                        return [
+                            TextContent(
+                                type="text",
+                                text=f"Recall index rebuilt: {count} entries",
+                            )
+                        ]
+
                     case _:
                         return [TextContent(type="text", text=f"Unknown tool: {name}")]
 
@@ -1620,6 +1871,13 @@ Date Range:
         # Sensory integration
         self._sensory_integration = SensoryIntegration(self._memory_store)
         logger.info("Sensory integration initialized")
+
+        # Recall index (pre-computed word→memory similarity)
+        try:
+            count = await self._memory_store.build_recall_index()
+            logger.info("Recall index built: %d entries", count)
+        except Exception as e:
+            logger.warning("Recall index build failed (non-fatal): %s", e)
 
     async def disconnect_memory(self) -> None:
         """Disconnect from memory store."""

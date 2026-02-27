@@ -24,7 +24,7 @@ def sample_chain(sample_steps):
         id="test-chain-1",
         steps=sample_steps,
         timestamp="2026-02-21T12:00:00+00:00",
-        emotion="happy",
+        emotion="1",
         importance=4,
         source="manual",
         context="テスト用体験",
@@ -128,8 +128,8 @@ class TestCrystallizeBuffer:
 
     def test_emotion_and_importance(self):
         entries = [{"v": ["見る", "思う"], "w": ["シオ"]}]
-        chains = crystallize_buffer(entries, emotion="happy", importance=5, min_verbs=1)
-        assert chains[0].emotion == "happy"
+        chains = crystallize_buffer(entries, emotion="1", importance=5, min_verbs=1)
+        assert chains[0].emotion == "1"
         assert chains[0].importance == 5
 
 
@@ -192,7 +192,7 @@ class TestVerbChainStore:
                 VerbStep(verb="笑う", nouns=("シオ",)),
             ),
             timestamp="2026-02-21T12:00:00+00:00",
-            emotion="happy",
+            emotion="1",
             importance=3,
             source="manual",
             context="",
@@ -204,7 +204,7 @@ class TestVerbChainStore:
                 VerbStep(verb="話す", nouns=("画面",)),
             ),
             timestamp="2026-02-21T13:00:00+00:00",
-            emotion="happy",
+            emotion="1",
             importance=3,
             source="manual",
             context="",
@@ -213,24 +213,27 @@ class TestVerbChainStore:
         await verb_chain_store.save(chain2)
 
         # "見る" → chain1 → chain1 has "笑う" → chain2 also has "笑う"
-        results = await verb_chain_store.expand_from_fragment(verb="見る", depth=2)
+        results, v_verbs, v_nouns = await verb_chain_store.expand_from_fragment(verb="見る", depth=2)
         result_ids = {c.id for c in results}
         assert "c1" in result_ids
         assert "c2" in result_ids
+        # visited_verbs/nouns が返ること
+        assert isinstance(v_verbs, list)
+        assert isinstance(v_nouns, list)
 
     async def test_expand_from_noun(self, verb_chain_store):
         chain1 = VerbChain(
             id="c1",
             steps=(VerbStep(verb="見る", nouns=("シオ",)),),
             timestamp="2026-02-21T12:00:00+00:00",
-            emotion="neutral",
+            emotion="8",
             importance=3,
             source="manual",
             context="",
         )
         await verb_chain_store.save(chain1)
 
-        results = await verb_chain_store.expand_from_fragment(noun="シオ", depth=1)
+        results, v_verbs, v_nouns = await verb_chain_store.expand_from_fragment(noun="シオ", depth=1)
         assert len(results) == 1
         assert results[0].id == "c1"
 

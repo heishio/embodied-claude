@@ -21,13 +21,13 @@ class TestMemorySave:
         """Test basic memory save."""
         memory = await memory_store.save(
             content="幼馴染と初めて会った日",
-            emotion="happy",
+            emotion="1",
             importance=5,
             category="memory",
         )
 
         assert memory.content == "幼馴染と初めて会った日"
-        assert memory.emotion == "happy"
+        assert memory.emotion == "1"
         assert memory.importance == 5
         assert memory.category == "memory"
         assert memory.id is not None
@@ -38,7 +38,7 @@ class TestMemorySave:
         """Test save with default values."""
         memory = await memory_store.save(content="Something happened")
 
-        assert memory.emotion == "neutral"
+        assert memory.emotion == "8"
         assert memory.importance == 3
         assert memory.category == "daily"
 
@@ -158,15 +158,15 @@ class TestMemoryStats:
     @pytest.mark.asyncio
     async def test_stats_counts(self, memory_store: MemoryStore):
         """Test statistics counts."""
-        await memory_store.save(content="Happy memory", emotion="happy", category="daily")
-        await memory_store.save(content="Sad memory", emotion="sad", category="feeling")
-        await memory_store.save(content="Another happy", emotion="happy", category="daily")
+        await memory_store.save(content="Happy memory", emotion="1", category="daily")
+        await memory_store.save(content="Sad memory", emotion="2", category="feeling")
+        await memory_store.save(content="Another happy", emotion="1", category="daily")
 
         stats = await memory_store.get_stats()
 
         assert stats.total_count == 3
-        assert stats.by_emotion.get("happy") == 2
-        assert stats.by_emotion.get("sad") == 1
+        assert stats.by_emotion.get("1") == 2
+        assert stats.by_emotion.get("2") == 1
         assert stats.by_category.get("daily") == 2
         assert stats.by_category.get("feeling") == 1
 
@@ -202,9 +202,9 @@ class TestScoringFunctions:
 
     def test_emotion_boost_values(self):
         """Test emotion boost returns expected values."""
-        assert calculate_emotion_boost("excited") == 0.4
-        assert calculate_emotion_boost("moved") == 0.3
-        assert calculate_emotion_boost("neutral") == 0.0
+        assert calculate_emotion_boost("5") == 0.4
+        assert calculate_emotion_boost("4") == 0.3
+        assert calculate_emotion_boost("8") == 0.0
         assert calculate_emotion_boost("unknown") == 0.0
 
     def test_importance_boost_values(self):
@@ -245,13 +245,13 @@ class TestAccessTracking:
     @pytest.mark.asyncio
     async def test_get_by_id(self, memory_store: MemoryStore):
         """Test retrieving memory by ID."""
-        memory = await memory_store.save(content="Findable memory", emotion="happy")
+        memory = await memory_store.save(content="Findable memory", emotion="1")
 
         found = await memory_store.get_by_id(memory.id)
 
         assert found is not None
         assert found.content == "Findable memory"
-        assert found.emotion == "happy"
+        assert found.emotion == "1"
 
     @pytest.mark.asyncio
     async def test_get_by_id_not_found(self, memory_store: MemoryStore):
@@ -324,8 +324,8 @@ class TestSearchWithScoring:
     @pytest.mark.asyncio
     async def test_search_with_scoring_returns_scored_memories(self, memory_store: MemoryStore):
         """Test search_with_scoring returns ScoredMemory objects."""
-        await memory_store.save(content="Important memory", importance=5, emotion="excited")
-        await memory_store.save(content="Regular memory", importance=3, emotion="neutral")
+        await memory_store.save(content="Important memory", importance=5, emotion="5")
+        await memory_store.save(content="Regular memory", importance=3, emotion="8")
 
         results = await memory_store.search_with_scoring(
             query="memory",

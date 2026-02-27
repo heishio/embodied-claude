@@ -17,19 +17,19 @@ class TestDivergentRecall:
     ):
         first = await memory_store.save(
             content="朝の空をカメラで探した",
-            emotion="excited",
+            emotion="5",
             category="observation",
             tags=("camera", "sky"),
         )
         second = await memory_store.save(
             content="窓の位置を変えて空を見つけた",
-            emotion="happy",
+            emotion="1",
             category="observation",
             tags=("window", "sky"),
         )
         await memory_store.save(
             content="夕飯の献立を考えた",
-            emotion="neutral",
+            emotion="8",
             category="daily",
         )
         await memory_store.add_causal_link(first.id, second.id, link_type="related")

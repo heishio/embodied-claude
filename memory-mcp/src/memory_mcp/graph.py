@@ -4,13 +4,15 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
+from datetime import datetime, timezone
 
 # Edge weights assigned when a chain is first saved (passive)
-WEIGHTS_INITIAL = {"vv": 0.1, "vn": 0.08, "nn": 0.05}
+# High initial weights so new memories stand out; consolidation normalises fast
+WEIGHTS_INITIAL = {"vv": 0.3, "vn": 0.2, "nn": 0.1}
 # Edge weights added when a chain is recalled (active reinforcement)
 WEIGHTS_RECALL = {"vv": 0.3, "vn": 0.2, "nn": 0.1}
 
-DECAY_FACTOR = 0.8
+DECAY_FACTOR = 0.95
 PRUNE_THRESHOLD = 0.01
 
 
@@ -107,8 +109,13 @@ class MemoryGraph:
         node_type: str,
         surface_form: str,
         limit: int = 20,
+        category_id: int | None = None,
     ) -> list[tuple[str, str, float]]:
-        """Return (type, surface_form, weight) of neighbours sorted by weight DESC."""
+        """Return (type, surface_form, weight) of neighbours sorted by weight DESC.
+
+        If category_id is given, only return neighbours whose nodes belong to
+        that category or any of its descendant categories.
+        """
 
         def _query() -> list[tuple[str, str, float]]:
             row = self._db.execute(
@@ -119,15 +126,34 @@ class MemoryGraph:
                 return []
             node_id = int(row[0]) if isinstance(row, tuple) else int(row["id"])
 
-            rows = self._db.execute(
-                """SELECT n.type, n.surface_form, e.weight
-                   FROM graph_edges e
-                   JOIN graph_nodes n ON n.id = e.to_id
-                   WHERE e.from_id = ?
-                   ORDER BY e.weight DESC
-                   LIMIT ?""",
-                (node_id, limit),
-            ).fetchall()
+            if category_id is not None:
+                # Use recursive CTE to get all descendant category IDs
+                rows = self._db.execute(
+                    """WITH RECURSIVE cat_tree(id) AS (
+                           SELECT id FROM categories WHERE id = ?
+                           UNION ALL
+                           SELECT c.id FROM categories c
+                           JOIN cat_tree ct ON c.parent_id = ct.id
+                       )
+                       SELECT n.type, n.surface_form, e.weight
+                       FROM graph_edges e
+                       JOIN graph_nodes n ON n.id = e.to_id
+                       JOIN node_categories nc ON nc.node_id = e.to_id
+                       WHERE e.from_id = ? AND nc.category_id IN (SELECT id FROM cat_tree)
+                       ORDER BY e.weight DESC
+                       LIMIT ?""",
+                    (category_id, node_id, limit),
+                ).fetchall()
+            else:
+                rows = self._db.execute(
+                    """SELECT n.type, n.surface_form, e.weight
+                       FROM graph_edges e
+                       JOIN graph_nodes n ON n.id = e.to_id
+                       WHERE e.from_id = ?
+                       ORDER BY e.weight DESC
+                       LIMIT ?""",
+                    (node_id, limit),
+                ).fetchall()
 
             result: list[tuple[str, str, float]] = []
             for r in rows:
@@ -138,6 +164,161 @@ class MemoryGraph:
             return result
 
         return await asyncio.to_thread(_query)
+
+    # ── Category API ─────────────────────────────
+
+    async def create_category(
+        self, name: str, parent_id: int | None = None
+    ) -> int:
+        """Create a category and return its ID."""
+
+        def _create() -> int:
+            now = datetime.now(timezone.utc).isoformat()
+            self._db.execute(
+                "INSERT INTO categories (name, parent_id, created_at) VALUES (?, ?, ?)",
+                (name, parent_id, now),
+            )
+            row = self._db.execute(
+                "SELECT id FROM categories WHERE name = ? AND parent_id IS ?",
+                (name, parent_id),
+            ).fetchone()
+            self._db.commit()
+            return int(row[0]) if isinstance(row, tuple) else int(row["id"])
+
+        return await asyncio.to_thread(_create)
+
+    async def list_categories(self) -> list[dict]:
+        """Return all categories as a flat list of dicts."""
+
+        def _list() -> list[dict]:
+            rows = self._db.execute(
+                "SELECT id, name, parent_id, created_at FROM categories ORDER BY id"
+            ).fetchall()
+            result: list[dict] = []
+            for r in rows:
+                if isinstance(r, tuple):
+                    result.append({"id": r[0], "name": r[1], "parent_id": r[2], "created_at": r[3]})
+                else:
+                    result.append({
+                        "id": r["id"], "name": r["name"],
+                        "parent_id": r["parent_id"], "created_at": r["created_at"],
+                    })
+            return result
+
+        return await asyncio.to_thread(_list)
+
+    async def get_category_node_ids(self, category_id: int) -> set[int]:
+        """Return all node IDs belonging to a category or its descendants (recursive CTE)."""
+
+        def _get() -> set[int]:
+            rows = self._db.execute(
+                """WITH RECURSIVE cat_tree(id) AS (
+                       SELECT id FROM categories WHERE id = ?
+                       UNION ALL
+                       SELECT c.id FROM categories c
+                       JOIN cat_tree ct ON c.parent_id = ct.id
+                   )
+                   SELECT nc.node_id FROM node_categories nc
+                   WHERE nc.category_id IN (SELECT id FROM cat_tree)""",
+                (category_id,),
+            ).fetchall()
+            return {int(r[0]) if isinstance(r, tuple) else int(r["node_id"]) for r in rows}
+
+        return await asyncio.to_thread(_get)
+
+    async def assign_node_category(self, node_id: int, category_id: int) -> None:
+        """Assign a node to a category."""
+
+        def _assign() -> None:
+            self._db.execute(
+                "INSERT OR IGNORE INTO node_categories (node_id, category_id) VALUES (?, ?)",
+                (node_id, category_id),
+            )
+            self._db.commit()
+
+        await asyncio.to_thread(_assign)
+
+    async def assign_chain_nodes_to_category(
+        self,
+        verbs: list[str],
+        nouns_per_step: list[list[str]],
+        category_id: int,
+    ) -> None:
+        """Assign all nodes from a chain's verbs/nouns to a category."""
+
+        def _assign() -> None:
+            for v in verbs:
+                row = self._db.execute(
+                    "SELECT id FROM graph_nodes WHERE type = 'verb' AND surface_form = ?",
+                    (v,),
+                ).fetchone()
+                if row:
+                    nid = int(row[0]) if isinstance(row, tuple) else int(row["id"])
+                    self._db.execute(
+                        "INSERT OR IGNORE INTO node_categories (node_id, category_id) VALUES (?, ?)",
+                        (nid, category_id),
+                    )
+            for nouns in nouns_per_step:
+                for n in nouns:
+                    row = self._db.execute(
+                        "SELECT id FROM graph_nodes WHERE type = 'noun' AND surface_form = ?",
+                        (n,),
+                    ).fetchone()
+                    if row:
+                        nid = int(row[0]) if isinstance(row, tuple) else int(row["id"])
+                        self._db.execute(
+                            "INSERT OR IGNORE INTO node_categories (node_id, category_id) VALUES (?, ?)",
+                            (nid, category_id),
+                        )
+            self._db.commit()
+
+        await asyncio.to_thread(_assign)
+
+    async def get_path_strength(
+        self, verbs: list[str], nouns: list[str]
+    ) -> float:
+        """指定された動詞/名詞間のグラフエッジ重み合計を返す。"""
+
+        def _calc() -> float:
+            total = 0.0
+
+            # Collect node IDs
+            verb_ids: list[int] = []
+            for v in verbs:
+                row = self._db.execute(
+                    "SELECT id FROM graph_nodes WHERE type = 'verb' AND surface_form = ?",
+                    (v,),
+                ).fetchone()
+                if row:
+                    verb_ids.append(int(row[0]) if isinstance(row, tuple) else int(row["id"]))
+
+            noun_ids: list[int] = []
+            for n in nouns:
+                row = self._db.execute(
+                    "SELECT id FROM graph_nodes WHERE type = 'noun' AND surface_form = ?",
+                    (n,),
+                ).fetchone()
+                if row:
+                    noun_ids.append(int(row[0]) if isinstance(row, tuple) else int(row["id"]))
+
+            all_ids = verb_ids + noun_ids
+            if len(all_ids) < 2:
+                return 0.0
+
+            # Sum weights of all edges between these nodes
+            placeholders = ",".join("?" for _ in all_ids)
+            rows = self._db.execute(
+                f"""SELECT SUM(weight) FROM graph_edges
+                    WHERE from_id IN ({placeholders}) AND to_id IN ({placeholders})""",
+                all_ids + all_ids,
+            ).fetchone()
+
+            if rows and rows[0] is not None:
+                total = float(rows[0])
+
+            return total
+
+        return await asyncio.to_thread(_calc)
 
     async def consolidate(
         self,
@@ -165,10 +346,10 @@ class MemoryGraph:
             for r in rows:
                 from_id = r[0] if isinstance(r, tuple) else r["from_id"]
                 avg_w = float(r[1] if isinstance(r, tuple) else r["avg_w"])
-                # Pull each edge 10% toward the average
+                # Pull each edge 50% toward the average
                 self._db.execute(
                     """UPDATE graph_edges
-                       SET weight = weight + 0.1 * (? - weight)
+                       SET weight = weight + 0.5 * (? - weight)
                        WHERE from_id = ?""",
                     (avg_w, from_id),
                 )

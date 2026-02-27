@@ -36,17 +36,17 @@ class TestEpisodeCreation:
         # Create 3 memories
         mem1 = await memory_store.save(
             content="Look around to find the sky",
-            emotion="curious",
+            emotion="7",
             importance=3,
         )
         mem2 = await memory_store.save(
             content="Found a window on the left",
-            emotion="curious",
+            emotion="7",
             importance=3,
         )
         mem3 = await memory_store.save(
             content="Found the morning sky! Beautiful blue and golden light",
-            emotion="excited",
+            emotion="5",
             importance=5,
         )
 
@@ -60,7 +60,7 @@ class TestEpisodeCreation:
         assert episode.title == "Morning sky search"
         assert len(episode.memory_ids) == 3
         assert episode.participants == ("幼馴染",)
-        assert episode.emotion == "excited"  # From highest importance memory
+        assert episode.emotion == "5"  # From highest importance memory
         assert episode.importance == 5
         assert episode.start_time == mem1.timestamp
         assert episode.end_time == mem3.timestamp

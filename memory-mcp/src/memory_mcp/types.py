@@ -6,19 +6,6 @@ from enum import Enum
 from typing import Any
 
 
-class Emotion(str, Enum):
-    """感情タグ."""
-
-    HAPPY = "happy"
-    SAD = "sad"
-    SURPRISED = "surprised"
-    MOVED = "moved"
-    EXCITED = "excited"
-    NOSTALGIC = "nostalgic"
-    CURIOUS = "curious"
-    NEUTRAL = "neutral"
-
-
 class Category(str, Enum):
     """記憶カテゴリ."""
 
@@ -221,6 +208,10 @@ class Memory:
     activation_count: int = 0
     last_activated: str = ""
     coactivation_weights: tuple[tuple[str, float], ...] = field(default_factory=tuple)
+    # 記憶の鮮度（心理的時間距離）
+    freshness: float = 1.0  # 1.0=さっき, 0.01=ずっと前
+    # 合成レベル（0=生の記憶, 1=一層目合成, 2+=将来の多層化用）
+    level: int = 0
 
     def to_metadata(self) -> dict[str, Any]:
         """Convert to dictionary for storage metadata."""
@@ -292,6 +283,7 @@ class VerbChain:
     importance: int  # 1-5
     source: str  # "buffer" | "manual"
     context: str  # 自由記述の補足
+    freshness: float = 1.0  # 1.0=さっき, 0.01=ずっと前
 
     def to_document(self) -> str:
         """埋め込み用テキスト."""
@@ -329,10 +321,11 @@ class VerbChain:
             id=chain_id,
             steps=steps,
             timestamp=metadata.get("timestamp", ""),
-            emotion=metadata.get("emotion", "neutral"),
+            emotion=metadata.get("emotion", "8"),
             importance=metadata.get("importance", 3),
             source=metadata.get("source", "manual"),
             context=metadata.get("context", ""),
+            freshness=float(metadata.get("freshness", 1.0)),
         )
 
 

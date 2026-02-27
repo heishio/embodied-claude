@@ -17,6 +17,7 @@ class WorkspaceCandidate:
     novelty: float
     prediction_error: float
     emotion_boost: float
+    boundary_score: float = 0.0
 
 
 def _candidate_utility(
@@ -30,6 +31,7 @@ def _candidate_utility(
         + 0.2 * candidate.novelty
         + 0.2 * candidate.prediction_error
         + 0.15 * candidate.emotion_boost
+        + 0.1 * candidate.boundary_score
         - 0.25 * redundancy_penalty
     )
     return utility / temp

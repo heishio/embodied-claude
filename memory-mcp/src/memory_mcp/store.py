@@ -63,7 +63,7 @@ CREATE TABLE IF NOT EXISTS memories (
     content TEXT NOT NULL,
     normalized_content TEXT NOT NULL,
     timestamp TEXT NOT NULL,
-    emotion TEXT NOT NULL DEFAULT 'neutral',
+    emotion TEXT NOT NULL DEFAULT '8',
     importance INTEGER NOT NULL DEFAULT 3,
     category TEXT NOT NULL DEFAULT 'daily',
     access_count INTEGER NOT NULL DEFAULT 0,
@@ -78,7 +78,9 @@ CREATE TABLE IF NOT EXISTS memories (
     prediction_error REAL NOT NULL DEFAULT 0.0,
     activation_count INTEGER NOT NULL DEFAULT 0,
     last_activated TEXT NOT NULL DEFAULT '',
-    reading TEXT
+    reading TEXT,
+    freshness REAL NOT NULL DEFAULT 1.0,
+    level INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_memories_emotion    ON memories(emotion);
 CREATE INDEX IF NOT EXISTS idx_memories_category   ON memories(category);
@@ -108,7 +110,7 @@ CREATE TABLE IF NOT EXISTS episodes (
     participants TEXT NOT NULL DEFAULT '',
     location_context TEXT,
     summary TEXT NOT NULL DEFAULT '',
-    emotion TEXT NOT NULL DEFAULT 'neutral',
+    emotion TEXT NOT NULL DEFAULT '8',
     importance INTEGER NOT NULL DEFAULT 3
 );
 
@@ -119,10 +121,11 @@ CREATE TABLE IF NOT EXISTS verb_chains (
     all_verbs TEXT NOT NULL,
     all_nouns TEXT NOT NULL,
     timestamp TEXT NOT NULL,
-    emotion TEXT NOT NULL DEFAULT 'neutral',
+    emotion TEXT NOT NULL DEFAULT '8',
     importance INTEGER NOT NULL DEFAULT 3,
     source TEXT NOT NULL DEFAULT 'buffer',
-    context TEXT NOT NULL DEFAULT ''
+    context TEXT NOT NULL DEFAULT '',
+    freshness REAL NOT NULL DEFAULT 1.0
 );
 
 CREATE TABLE IF NOT EXISTS verb_chain_embeddings (
@@ -147,6 +150,52 @@ CREATE TABLE IF NOT EXISTS graph_edges (
 CREATE INDEX IF NOT EXISTS idx_graph_edges_from ON graph_edges(from_id);
 CREATE INDEX IF NOT EXISTS idx_graph_edges_to ON graph_edges(to_id);
 CREATE INDEX IF NOT EXISTS idx_graph_edges_weight ON graph_edges(weight);
+
+CREATE TABLE IF NOT EXISTS categories (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    parent_id INTEGER REFERENCES categories(id),
+    created_at TEXT NOT NULL,
+    UNIQUE(name, parent_id)
+);
+
+CREATE TABLE IF NOT EXISTS node_categories (
+    node_id INTEGER NOT NULL REFERENCES graph_nodes(id) ON DELETE CASCADE,
+    category_id INTEGER NOT NULL REFERENCES categories(id) ON DELETE CASCADE,
+    PRIMARY KEY (node_id, category_id)
+);
+
+CREATE TABLE IF NOT EXISTS recall_index (
+    word TEXT NOT NULL,
+    target_id TEXT NOT NULL,
+    target_type TEXT NOT NULL DEFAULT 'memory',
+    similarity REAL NOT NULL,
+    content_preview TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (word, target_id, target_type)
+);
+CREATE INDEX IF NOT EXISTS idx_recall_word ON recall_index(word);
+
+CREATE TABLE IF NOT EXISTS composite_members (
+    composite_id TEXT NOT NULL,
+    member_id TEXT NOT NULL,
+    contribution_weight REAL DEFAULT 1.0,
+    PRIMARY KEY (composite_id, member_id)
+);
+CREATE INDEX IF NOT EXISTS idx_composite_members_member ON composite_members(member_id);
+
+CREATE TABLE IF NOT EXISTS boundary_layers (
+    composite_id TEXT NOT NULL,
+    member_id TEXT NOT NULL,
+    layer_index INTEGER NOT NULL,
+    is_edge INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (composite_id, member_id, layer_index)
+);
+CREATE INDEX IF NOT EXISTS idx_boundary_layers_composite ON boundary_layers(composite_id);
+
+CREATE TABLE IF NOT EXISTS meta (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
 """
 
 # ──────────────────────────────────────────────
@@ -221,6 +270,8 @@ def _row_to_memory(row: sqlite3.Row, coactivation: tuple[tuple[str, float], ...]
         activation_count=int(row["activation_count"] or 0),
         last_activated=row["last_activated"] or "",
         coactivation_weights=coactivation,
+        freshness=float(row["freshness"]) if row["freshness"] is not None else 1.0,
+        level=int(row["level"]) if row["level"] is not None else 0,
     )
 
 
@@ -278,6 +329,67 @@ class MemoryStore:
                         stmt = stmt.strip()
                         if stmt:
                             conn.execute(stmt)
+                    # Migration: add category_id to verb_chains if missing
+                    cols = [r[1] for r in conn.execute("PRAGMA table_info(verb_chains)").fetchall()]
+                    if "category_id" not in cols:
+                        conn.execute("ALTER TABLE verb_chains ADD COLUMN category_id INTEGER REFERENCES categories(id)")
+                    # Migration: emotion labels → numbers (1-8)
+                    _emotion_map = {
+                        "happy": "1", "sad": "2", "surprised": "3", "moved": "4",
+                        "excited": "5", "nostalgic": "6", "curious": "7", "neutral": "8",
+                    }
+                    for old, new in _emotion_map.items():
+                        conn.execute("UPDATE memories SET emotion = ? WHERE emotion = ?", (new, old))
+                        conn.execute("UPDATE verb_chains SET emotion = ? WHERE emotion = ?", (new, old))
+                        conn.execute("UPDATE episodes SET emotion = ? WHERE emotion = ?", (new, old))
+                    # Migration: add freshness column
+                    mem_cols = [r[1] for r in conn.execute("PRAGMA table_info(memories)").fetchall()]
+                    if "freshness" not in mem_cols:
+                        conn.execute("ALTER TABLE memories ADD COLUMN freshness REAL NOT NULL DEFAULT 1.0")
+                        # Initialize freshness for existing memories based on age
+                        now = datetime.now(timezone.utc)
+                        for row in conn.execute("SELECT id, timestamp FROM memories WHERE freshness = 1.0").fetchall():
+                            try:
+                                ts = datetime.fromisoformat(row[1])
+                                if ts.tzinfo is None:
+                                    ts = ts.replace(tzinfo=timezone.utc)
+                                age_days = (now - ts).days
+                                if age_days > 0:
+                                    freshness = max(0.01, 0.85 ** age_days)
+                                    conn.execute("UPDATE memories SET freshness = ? WHERE id = ?", (freshness, row[0]))
+                            except (ValueError, TypeError):
+                                pass
+                    # Migration: add level column to memories
+                    if "level" not in mem_cols:
+                        conn.execute("ALTER TABLE memories ADD COLUMN level INTEGER NOT NULL DEFAULT 0")
+                    vc_cols = [r[1] for r in conn.execute("PRAGMA table_info(verb_chains)").fetchall()]
+                    if "freshness" not in vc_cols:
+                        conn.execute("ALTER TABLE verb_chains ADD COLUMN freshness REAL NOT NULL DEFAULT 1.0")
+                        now = datetime.now(timezone.utc)
+                        for row in conn.execute("SELECT id, timestamp FROM verb_chains WHERE freshness = 1.0").fetchall():
+                            try:
+                                ts = datetime.fromisoformat(row[1])
+                                if ts.tzinfo is None:
+                                    ts = ts.replace(tzinfo=timezone.utc)
+                                age_days = (now - ts).days
+                                if age_days > 0:
+                                    freshness = max(0.01, 0.85 ** age_days)
+                                    conn.execute("UPDATE verb_chains SET freshness = ? WHERE id = ?", (freshness, row[0]))
+                            except (ValueError, TypeError):
+                                pass
+                    # Migration: create boundary_layers table if missing
+                    existing_tables = {r[0] for r in conn.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table'"
+                    ).fetchall()}
+                    if "boundary_layers" not in existing_tables:
+                        conn.execute("""CREATE TABLE IF NOT EXISTS boundary_layers (
+                            composite_id TEXT NOT NULL,
+                            member_id TEXT NOT NULL,
+                            layer_index INTEGER NOT NULL,
+                            is_edge INTEGER NOT NULL DEFAULT 0,
+                            PRIMARY KEY (composite_id, member_id, layer_index)
+                        )""")
+                        conn.execute("CREATE INDEX IF NOT EXISTS idx_boundary_layers_composite ON boundary_layers(composite_id)")
                     conn.commit()
                     return conn
 
@@ -349,7 +461,7 @@ class MemoryStore:
     async def save(
         self,
         content: str,
-        emotion: str = "neutral",
+        emotion: str = "8",
         importance: int = 3,
         category: str = "daily",
         episode_id: str | None = None,
@@ -384,14 +496,30 @@ class MemoryStore:
 
         def _insert() -> None:
             meta = memory.to_metadata()
+            # Decay freshness only for post-consolidation memories
+            cutoff = db.execute(
+                "SELECT COALESCE((SELECT value FROM meta WHERE key = 'last_consolidated_at'), '')"
+            ).fetchone()[0]
+            if cutoff:
+                db.execute(
+                    "UPDATE memories SET freshness = MAX(0.01, freshness - 0.003) WHERE timestamp > ?",
+                    (cutoff,),
+                )
+                db.execute(
+                    "UPDATE verb_chains SET freshness = MAX(0.01, freshness - 0.003) WHERE timestamp > ?",
+                    (cutoff,),
+                )
+            else:
+                db.execute("UPDATE memories SET freshness = MAX(0.01, freshness - 0.003)")
+                db.execute("UPDATE verb_chains SET freshness = MAX(0.01, freshness - 0.003)")
             db.execute(
                 """INSERT INTO memories (
                     id, content, normalized_content, timestamp,
                     emotion, importance, category, access_count, last_accessed,
                     linked_ids, episode_id, sensory_data, camera_position,
                     tags, links, novelty_score, prediction_error,
-                    activation_count, last_activated, reading
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    activation_count, last_activated, reading, freshness, level
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     memory_id, content, normalized_content, timestamp,
                     emotion, importance, category,
@@ -400,7 +528,7 @@ class MemoryStore:
                     meta.get("sensory_data", ""),
                     meta.get("camera_position") or None,
                     meta.get("tags", ""), meta.get("links", ""),
-                    0.0, 0.0, 0, "", reading,
+                    0.0, 0.0, 0, "", reading, 1.0, 0,
                 ),
             )
             db.execute(
@@ -659,7 +787,7 @@ class MemoryStore:
         by_emotion: dict[str, int] = {}
         for row in rows:
             cat = row["category"] or "daily"
-            emo = row["emotion"] or "neutral"
+            emo = row["emotion"] or "8"
             by_category[cat] = by_category.get(cat, 0) + 1
             by_emotion[emo] = by_emotion.get(emo, 0) + 1
 
@@ -708,6 +836,37 @@ class MemoryStore:
         return await asyncio.to_thread(_fetch)
 
     # ── update_access ───────────────────────────
+
+    # ── freshness ───────────────────────────────
+
+    async def decay_all_freshness(self, amount: float = 0.003) -> None:
+        """全記憶・チェーンの freshness を微量減少させる。"""
+        db = self._ensure_connected()
+
+        def _decay() -> None:
+            db.execute("UPDATE memories SET freshness = MAX(0.01, freshness - ?)", (amount,))
+            db.execute("UPDATE verb_chains SET freshness = MAX(0.01, freshness - ?)", (amount,))
+            db.commit()
+
+        await asyncio.to_thread(_decay)
+
+    async def consolidate_freshness(self, factor: float = 0.92) -> None:
+        """コンソリデート時に全 freshness を割合減衰させ、タイムスタンプを記録。"""
+        db = self._ensure_connected()
+
+        def _consolidate() -> None:
+            db.execute("UPDATE memories SET freshness = MAX(0.01, freshness * ?)", (factor,))
+            db.execute("UPDATE verb_chains SET freshness = MAX(0.01, freshness * ?)", (factor,))
+            now = datetime.now(timezone.utc).isoformat()
+            db.execute(
+                "INSERT OR REPLACE INTO meta (key, value) VALUES ('last_consolidated_at', ?)",
+                (now,),
+            )
+            db.commit()
+
+        await asyncio.to_thread(_consolidate)
+
+    # ── update_access ──────────────────────────
 
     async def update_access(self, memory_id: str) -> None:
         db = self._ensure_connected()
@@ -849,12 +1008,255 @@ class MemoryStore:
         )
         return True
 
+    # ── Recall Index (pre-computed word→memory similarity) ──
+
+    async def build_recall_index(self) -> int:
+        """Build the recall_index table from scratch.
+
+        Collects vocabulary from graph_nodes (preferred) and verb_chains,
+        encodes each word with E5 query prefix, computes cosine similarity
+        against all memory and chain embeddings, and stores top-20 per word.
+
+        Returns the number of word→target entries inserted.
+        """
+        import logging
+
+        logger = logging.getLogger(__name__)
+        db = self._ensure_connected()
+
+        # 1. Collect vocabulary from graph_nodes (highest quality - sudachipy output)
+        vocab: set[str] = set()
+
+        def _collect_vocab() -> set[str]:
+            words: set[str] = set()
+            # graph_nodes: clean verb/noun surface forms
+            rows = db.execute(
+                "SELECT surface_form FROM graph_nodes WHERE type IN ('verb', 'noun')"
+            ).fetchall()
+            for row in rows:
+                w = row[0].strip()
+                if w:
+                    words.add(w)
+
+            # Supplement from verb_chains all_nouns/all_verbs (comma-separated)
+            rows = db.execute("SELECT all_nouns, all_verbs FROM verb_chains").fetchall()
+            for row in rows:
+                for field in (row[0], row[1]):
+                    if field:
+                        for w in field.split(","):
+                            w = w.strip()
+                            if w:
+                                words.add(w)
+            return words
+
+        vocab = await asyncio.to_thread(_collect_vocab)
+
+        if not vocab:
+            logger.warning("build_recall_index: no vocabulary found, skipping")
+            return 0
+
+        vocab_list = sorted(vocab)
+        logger.info("build_recall_index: %d vocabulary words collected", len(vocab_list))
+
+        # 2. Encode all vocabulary words as queries
+        word_vectors = await asyncio.to_thread(
+            self._embedding_fn.encode_query, vocab_list
+        )
+        word_vecs_np = np.array(word_vectors, dtype=np.float32)  # (V, dim)
+
+        # 3. Load all memory embeddings
+        def _load_memory_embeddings() -> tuple[list[str], list[str], np.ndarray | None]:
+            rows = db.execute(
+                "SELECT e.memory_id, m.content, e.vector "
+                "FROM embeddings e JOIN memories m ON e.memory_id = m.id"
+            ).fetchall()
+            if not rows:
+                return [], [], None
+            ids = [r[0] for r in rows]
+            previews = [r[1][:20] if r[1] else "" for r in rows]
+            vecs = np.array(
+                [decode_vector(r[2]) for r in rows], dtype=np.float32
+            )
+            return ids, previews, vecs
+
+        mem_ids, mem_previews, mem_vecs = await asyncio.to_thread(_load_memory_embeddings)
+
+        # 4. Load all verb_chain embeddings
+        def _load_chain_embeddings() -> tuple[list[str], list[str], np.ndarray | None]:
+            rows = db.execute(
+                "SELECT ce.chain_id, vc.context, ce.vector "
+                "FROM verb_chain_embeddings ce "
+                "JOIN verb_chains vc ON ce.chain_id = vc.id"
+            ).fetchall()
+            if not rows:
+                return [], [], None
+            ids = [r[0] for r in rows]
+            previews = [r[1][:20] if r[1] else "" for r in rows]
+            vecs = np.array(
+                [decode_vector(r[2]) for r in rows], dtype=np.float32
+            )
+            return ids, previews, vecs
+
+        chain_ids, chain_previews, chain_vecs = await asyncio.to_thread(
+            _load_chain_embeddings
+        )
+
+        if mem_vecs is None and chain_vecs is None:
+            logger.warning("build_recall_index: no embeddings found, skipping")
+            return 0
+
+        # 5. Compute similarities and build index entries
+        TOP_K = 20
+        entries: list[tuple[str, str, str, float, str]] = []
+
+        for i, word in enumerate(vocab_list):
+            word_vec = word_vecs_np[i]
+            candidates: list[tuple[str, str, float, str]] = []
+
+            if mem_vecs is not None:
+                sims = cosine_similarity(word_vec, mem_vecs)
+                for j in range(len(mem_ids)):
+                    candidates.append((mem_ids[j], "memory", float(sims[j]), mem_previews[j]))
+
+            if chain_vecs is not None:
+                sims = cosine_similarity(word_vec, chain_vecs)
+                for j in range(len(chain_ids)):
+                    candidates.append((chain_ids[j], "chain", float(sims[j]), chain_previews[j]))
+
+            # Sort by similarity descending, keep top-K
+            candidates.sort(key=lambda x: x[2], reverse=True)
+            for target_id, target_type, sim, preview in candidates[:TOP_K]:
+                entries.append((word, target_id, target_type, sim, preview))
+
+        # 6. Write to database (clear and rebuild)
+        def _write_index() -> int:
+            db.execute("DELETE FROM recall_index")
+            db.executemany(
+                "INSERT OR REPLACE INTO recall_index "
+                "(word, target_id, target_type, similarity, content_preview) "
+                "VALUES (?, ?, ?, ?, ?)",
+                entries,
+            )
+            db.commit()
+            return len(entries)
+
+        count = await asyncio.to_thread(_write_index)
+        logger.info("build_recall_index: %d entries written", count)
+        return count
+
+    async def update_recall_index(self, memory_id: str, target_type: str = "memory") -> int:
+        """Incrementally update recall_index for a single new memory/chain.
+
+        Computes similarity of the new embedding against all vocabulary words,
+        and inserts into recall_index if it ranks in the top-20 for that word.
+
+        Returns the number of entries added/updated.
+        """
+        db = self._ensure_connected()
+
+        # Load the new embedding
+        def _load_embedding() -> bytes | None:
+            table = "embeddings" if target_type == "memory" else "verb_chain_embeddings"
+            id_col = "memory_id" if target_type == "memory" else "chain_id"
+            row = db.execute(
+                f"SELECT vector FROM {table} WHERE {id_col} = ?", (memory_id,)
+            ).fetchone()
+            return row[0] if row else None
+
+        blob = await asyncio.to_thread(_load_embedding)
+        if blob is None:
+            return 0
+
+        new_vec = decode_vector(blob)
+
+        # Load content preview
+        def _load_preview() -> str:
+            if target_type == "memory":
+                row = db.execute(
+                    "SELECT content FROM memories WHERE id = ?", (memory_id,)
+                ).fetchone()
+                return row[0][:20] if row and row[0] else ""
+            else:
+                row = db.execute(
+                    "SELECT context FROM verb_chains WHERE id = ?", (memory_id,)
+                ).fetchone()
+                return row[0][:20] if row and row[0] else ""
+
+        preview = await asyncio.to_thread(_load_preview)
+
+        # Get all vocabulary words from recall_index (distinct words)
+        def _get_vocab() -> list[str]:
+            rows = db.execute("SELECT DISTINCT word FROM recall_index").fetchall()
+            return [r[0] for r in rows]
+
+        vocab_list = await asyncio.to_thread(_get_vocab)
+        if not vocab_list:
+            return 0
+
+        # Encode vocabulary words as queries
+        word_vectors = await asyncio.to_thread(
+            self._embedding_fn.encode_query, vocab_list
+        )
+        word_vecs_np = np.array(word_vectors, dtype=np.float32)
+
+        # Compute similarity of new memory against each word
+        sims = cosine_similarity(new_vec, word_vecs_np)  # (V,)
+
+        TOP_K = 20
+        updated = 0
+
+        def _update_entries() -> int:
+            count = 0
+            for i, word in enumerate(vocab_list):
+                sim = float(sims[i])
+
+                # Check if this beats the lowest score in top-20 for this word
+                rows = db.execute(
+                    "SELECT similarity FROM recall_index "
+                    "WHERE word = ? ORDER BY similarity ASC LIMIT 1",
+                    (word,),
+                ).fetchall()
+
+                existing_count = db.execute(
+                    "SELECT COUNT(*) FROM recall_index WHERE word = ?", (word,)
+                ).fetchone()[0]
+
+                if existing_count < TOP_K:
+                    # Room to add
+                    db.execute(
+                        "INSERT OR REPLACE INTO recall_index "
+                        "(word, target_id, target_type, similarity, content_preview) "
+                        "VALUES (?, ?, ?, ?, ?)",
+                        (word, memory_id, target_type, sim, preview),
+                    )
+                    count += 1
+                elif rows and sim > rows[0][0]:
+                    # Replace the lowest-scoring entry
+                    # First delete the lowest
+                    db.execute(
+                        "DELETE FROM recall_index WHERE word = ? AND similarity = ("
+                        "SELECT MIN(similarity) FROM recall_index WHERE word = ?)",
+                        (word, word),
+                    )
+                    db.execute(
+                        "INSERT OR REPLACE INTO recall_index "
+                        "(word, target_id, target_type, similarity, content_preview) "
+                        "VALUES (?, ?, ?, ?, ?)",
+                        (word, memory_id, target_type, sim, preview),
+                    )
+                    count += 1
+            db.commit()
+            return count
+
+        updated = await asyncio.to_thread(_update_entries)
+        return updated
+
     # ── save_with_auto_link ─────────────────────
 
     async def save_with_auto_link(
         self,
         content: str,
-        emotion: str = "neutral",
+        emotion: str = "8",
         importance: int = 3,
         category: str = "daily",
         link_threshold: float = 0.8,
@@ -886,20 +1288,36 @@ class MemoryStore:
 
         def _insert() -> None:
             meta = memory.to_metadata()
+            # Decay freshness only for post-consolidation memories
+            cutoff = db.execute(
+                "SELECT COALESCE((SELECT value FROM meta WHERE key = 'last_consolidated_at'), '')"
+            ).fetchone()[0]
+            if cutoff:
+                db.execute(
+                    "UPDATE memories SET freshness = MAX(0.01, freshness - 0.003) WHERE timestamp > ?",
+                    (cutoff,),
+                )
+                db.execute(
+                    "UPDATE verb_chains SET freshness = MAX(0.01, freshness - 0.003) WHERE timestamp > ?",
+                    (cutoff,),
+                )
+            else:
+                db.execute("UPDATE memories SET freshness = MAX(0.01, freshness - 0.003)")
+                db.execute("UPDATE verb_chains SET freshness = MAX(0.01, freshness - 0.003)")
             db.execute(
                 """INSERT INTO memories (
                     id, content, normalized_content, timestamp,
                     emotion, importance, category, access_count, last_accessed,
                     linked_ids, episode_id, sensory_data, camera_position,
                     tags, links, novelty_score, prediction_error,
-                    activation_count, last_activated, reading
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    activation_count, last_activated, reading, freshness
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     memory_id, content, normalized_content, timestamp,
                     emotion, importance, category,
                     0, "",
                     meta.get("linked_ids", ""), None,
-                    "", None, "", "", 0.0, 0.0, 0, "", reading,
+                    "", None, "", "", 0.0, 0.0, 0, "", reading, 1.0,
                 ),
             )
             db.execute(
@@ -1203,6 +1621,24 @@ class MemoryStore:
         for memory in seed_memories + expanded:
             all_candidates[memory.id] = memory
 
+        # ── Boundary-aware composite edge expansion ──
+        # spread 後に level=1 の composite を抽出して edge メンバー + 隣接 composite を展開
+        composite_ids = [
+            mid for mid, mem in all_candidates.items() if mem.level == 1
+        ]
+        if composite_ids:
+            normalized_query = normalize_japanese(context)
+            query_emb = await self._encode_query(normalized_query)
+            query_vec = np.array(query_emb, dtype=np.float32)
+            edge_memories = await self.expand_composite_edges(composite_ids, query_vec)
+            for mem in edge_memories:
+                if mem.id not in all_candidates:
+                    all_candidates[mem.id] = mem
+
+        # ── Boundary fuzziness scores ──
+        all_ids = list(all_candidates.keys())
+        boundary_scores = await self.get_member_boundary_scores(all_ids)
+
         workspace_candidates: list[WorkspaceCandidate] = []
         prediction_errors: list[float] = []
         novelty_scores: list[float] = []
@@ -1228,6 +1664,7 @@ class MemoryStore:
                     novelty=novelty,
                     prediction_error=prediction_error,
                     emotion_boost=normalized_emotion,
+                    boundary_score=boundary_scores.get(memory.id, 0.0),
                 )
             )
 
@@ -1285,6 +1722,9 @@ class MemoryStore:
         window_hours: int = 24,
         max_replay_events: int = 200,
         link_update_strength: float = 0.2,
+        synthesize: bool = True,
+        n_layers: int = 3,
+        graph: "Any | None" = None,
     ) -> dict[str, int]:
         stats = await self._consolidation_engine.run(
             store=self,
@@ -1292,7 +1732,456 @@ class MemoryStore:
             max_replay_events=max_replay_events,
             link_update_strength=link_update_strength,
         )
-        return stats.to_dict()
+        result = stats.to_dict()
+
+        if synthesize:
+            synth_stats = await self._consolidation_engine.synthesize_composites(
+                store=self,
+            )
+            result.update(synth_stats)
+
+            # Boundary layers computation (after composite synthesis)
+            boundary_stats = await self._consolidation_engine.compute_boundary_layers(
+                store=self,
+                graph=graph,
+                n_layers=n_layers,
+            )
+            result.update(boundary_stats)
+
+        return result
+
+    async def fetch_level0_memories_with_vectors(
+        self,
+        min_freshness: float = 0.1,
+    ) -> list[tuple[Memory, np.ndarray]]:
+        """level=0 かつ freshness > min_freshness の記憶とベクトルを取得。"""
+        db = self._ensure_connected()
+
+        def _fetch() -> list[tuple[sqlite3.Row, bytes]]:
+            rows = db.execute(
+                """SELECT m.*, e.vector FROM memories m
+                   JOIN embeddings e ON e.memory_id = m.id
+                   WHERE m.level = 0 AND m.freshness > ?""",
+                (min_freshness,),
+            ).fetchall()
+            return [(row, bytes(row["vector"])) for row in rows]
+
+        raw = await asyncio.to_thread(_fetch)
+        results: list[tuple[Memory, np.ndarray]] = []
+        for row, vec_blob in raw:
+            mem = _row_to_memory(row)
+            vec = decode_vector(vec_blob)
+            results.append((mem, vec))
+        return results
+
+    async def get_existing_composite_members(self) -> list[frozenset[str]]:
+        """既存の合成記憶のメンバー構成をすべて取得。"""
+        db = self._ensure_connected()
+
+        def _fetch() -> list[frozenset[str]]:
+            composites: dict[str, set[str]] = {}
+            for row in db.execute("SELECT composite_id, member_id FROM composite_members").fetchall():
+                cid = row["composite_id"]
+                if cid not in composites:
+                    composites[cid] = set()
+                composites[cid].add(row["member_id"])
+            return [frozenset(members) for members in composites.values()]
+
+        return await asyncio.to_thread(_fetch)
+
+    async def save_composite(
+        self,
+        member_ids: list[str],
+        vector: np.ndarray,
+        emotion: str,
+        importance: int,
+        freshness: float,
+        category: str,
+    ) -> str:
+        """合成記憶を保存し、composite_members に関係を登録。"""
+        db = self._ensure_connected()
+        composite_id = str(uuid.uuid4())
+        timestamp = datetime.now(timezone.utc).isoformat()
+        vector_blob = encode_vector(vector.tolist())
+
+        def _insert() -> None:
+            db.execute(
+                """INSERT INTO memories (
+                    id, content, normalized_content, timestamp,
+                    emotion, importance, category, access_count, last_accessed,
+                    linked_ids, episode_id, sensory_data, camera_position,
+                    tags, links, novelty_score, prediction_error,
+                    activation_count, last_activated, reading, freshness, level
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    composite_id, "", "", timestamp,
+                    emotion, importance, category,
+                    0, "",
+                    "", None,
+                    "", None,
+                    "", "",
+                    0.0, 0.0, 0, "", None, freshness, 1,
+                ),
+            )
+            db.execute(
+                "INSERT INTO embeddings (memory_id, vector) VALUES (?,?)",
+                (composite_id, vector_blob),
+            )
+            for mid in member_ids:
+                db.execute(
+                    "INSERT INTO composite_members (composite_id, member_id) VALUES (?,?)",
+                    (composite_id, mid),
+                )
+            db.commit()
+
+        await asyncio.to_thread(_insert)
+        return composite_id
+
+    # ── Boundary layers ──────────────────────────
+
+    async def clear_boundary_layers(self, composite_id: str | None = None) -> None:
+        """boundary_layers をクリア。composite_id 指定時はそのcompositeのみ。"""
+        db = self._ensure_connected()
+
+        def _clear() -> None:
+            if composite_id:
+                db.execute("DELETE FROM boundary_layers WHERE composite_id = ?", (composite_id,))
+            else:
+                db.execute("DELETE FROM boundary_layers")
+            db.commit()
+
+        await asyncio.to_thread(_clear)
+
+    async def save_boundary_layers(
+        self,
+        composite_id: str,
+        layers: list[tuple[str, int, int]],
+    ) -> None:
+        """boundary_layers を一括保存。layers: list of (member_id, layer_index, is_edge)。"""
+        db = self._ensure_connected()
+
+        def _save() -> None:
+            db.executemany(
+                "INSERT OR REPLACE INTO boundary_layers (composite_id, member_id, layer_index, is_edge) VALUES (?,?,?,?)",
+                [(composite_id, mid, lidx, edge) for mid, lidx, edge in layers],
+            )
+            db.commit()
+
+        await asyncio.to_thread(_save)
+
+    async def fetch_composite_with_vectors(
+        self, composite_id: str
+    ) -> list[tuple[str, np.ndarray]]:
+        """compositeのメンバーIDとベクトルを取得。"""
+        db = self._ensure_connected()
+
+        def _fetch() -> list[tuple[str, bytes]]:
+            rows = db.execute(
+                """SELECT cm.member_id, e.vector
+                   FROM composite_members cm
+                   JOIN embeddings e ON e.memory_id = cm.member_id
+                   WHERE cm.composite_id = ?""",
+                (composite_id,),
+            ).fetchall()
+            return [(row["member_id"], bytes(row["vector"])) for row in rows]
+
+        raw = await asyncio.to_thread(_fetch)
+        return [(mid, decode_vector(blob)) for mid, blob in raw]
+
+    async def fetch_composite_centroid(self, composite_id: str) -> np.ndarray | None:
+        """compositeの重心ベクトル（= embeddings に保存済みのベクトル）を取得。"""
+        db = self._ensure_connected()
+
+        def _fetch() -> bytes | None:
+            row = db.execute(
+                "SELECT vector FROM embeddings WHERE memory_id = ?",
+                (composite_id,),
+            ).fetchone()
+            return bytes(row["vector"]) if row else None
+
+        blob = await asyncio.to_thread(_fetch)
+        return decode_vector(blob) if blob else None
+
+    async def fetch_all_composite_ids(self) -> list[str]:
+        """全composite IDを取得。"""
+        db = self._ensure_connected()
+
+        def _fetch() -> list[str]:
+            rows = db.execute(
+                "SELECT DISTINCT id FROM memories WHERE level = 1"
+            ).fetchall()
+            return [row["id"] for row in rows]
+
+        return await asyncio.to_thread(_fetch)
+
+    # ── Boundary-aware recall helpers ────────────
+
+    async def get_member_boundary_scores(
+        self, memory_ids: list[str]
+    ) -> dict[str, float]:
+        """memory_ids の fuzziness スコアを取得。
+
+        fuzziness = 全レイヤーで edge に分類された回数 / 全レイヤー数。
+        0.0=常にcore, 1.0=常にedge。boundary_layers に存在しない ID は結果に含まない。
+        """
+        if not memory_ids:
+            return {}
+        db = self._ensure_connected()
+
+        def _calc() -> dict[str, float]:
+            placeholders = ",".join("?" for _ in memory_ids)
+            rows = db.execute(
+                f"""SELECT bl.member_id,
+                           CAST(SUM(bl.is_edge) AS REAL) / COUNT(*) as fuzziness
+                    FROM boundary_layers bl
+                    WHERE bl.member_id IN ({placeholders})
+                    GROUP BY bl.member_id""",
+                memory_ids,
+            ).fetchall()
+            return {row["member_id"]: row["fuzziness"] for row in rows}
+
+        return await asyncio.to_thread(_calc)
+
+    async def select_active_boundary_layer(
+        self, path_vec: np.ndarray, n_layers_max: int = 10,
+    ) -> int:
+        """経路ベクトルに最も aligned な boundary layer を選択。
+
+        各レイヤーの edge メンバーの平均ベクトルと path_vec の cos sim を計算。
+        最も高い layer_index を返す。edge データがなければ 0 を返す。
+        """
+        db = self._ensure_connected()
+
+        def _select() -> int:
+            # 全レイヤーのインデックスを取得
+            layer_rows = db.execute(
+                "SELECT DISTINCT layer_index FROM boundary_layers ORDER BY layer_index"
+            ).fetchall()
+            if not layer_rows:
+                return 0
+
+            layer_indices = [r["layer_index"] for r in layer_rows][:n_layers_max]
+
+            best_layer = 0
+            best_sim = -2.0
+
+            for lidx in layer_indices:
+                # このレイヤーの edge メンバーのベクトルを取得
+                edge_rows = db.execute(
+                    """SELECT e.vector
+                       FROM boundary_layers bl
+                       JOIN embeddings e ON e.memory_id = bl.member_id
+                       WHERE bl.layer_index = ? AND bl.is_edge = 1""",
+                    (lidx,),
+                ).fetchall()
+                if not edge_rows:
+                    continue
+
+                edge_vecs = [decode_vector(bytes(r["vector"])) for r in edge_rows]
+                edge_mean = np.mean(edge_vecs, axis=0).reshape(1, -1)
+                sim = float(cosine_similarity(path_vec, edge_mean)[0])
+
+                if sim > best_sim:
+                    best_sim = sim
+                    best_layer = lidx
+
+            return best_layer
+
+        return await asyncio.to_thread(_select)
+
+    async def get_chain_boundary_scores(
+        self,
+        chain_ids: list[str],
+        layer_index: int | None = None,
+    ) -> dict[str, float]:
+        """verb chain の boundary 近接スコアを計算。
+
+        layer_index 指定時: そのレイヤーの edge メンバーとの類似度ベース
+        layer_index=None: fuzziness（全レイヤー横断）ベース
+
+        Returns: {chain_id: boundary_score} (0.0〜1.0)
+        """
+        if not chain_ids:
+            return {}
+
+        db = self._ensure_connected()
+
+        def _calc() -> dict[str, float]:
+            # chain embeddings を取得
+            placeholders = ",".join("?" for _ in chain_ids)
+            chain_rows = db.execute(
+                f"""SELECT chain_id, vector FROM verb_chain_embeddings
+                    WHERE chain_id IN ({placeholders})""",
+                chain_ids,
+            ).fetchall()
+            if not chain_rows:
+                return {}
+
+            chain_vecs = {
+                r["chain_id"]: decode_vector(bytes(r["vector"]))
+                for r in chain_rows
+            }
+
+            if layer_index is not None:
+                # 指定レイヤーの edge メンバーのベクトルを取得
+                edge_rows = db.execute(
+                    """SELECT e.vector
+                       FROM boundary_layers bl
+                       JOIN embeddings e ON e.memory_id = bl.member_id
+                       WHERE bl.layer_index = ? AND bl.is_edge = 1""",
+                    (layer_index,),
+                ).fetchall()
+            else:
+                # fuzziness ベース: fuzziness > 0.5 のメンバーを edge とみなす
+                edge_rows = db.execute(
+                    """SELECT e.vector
+                       FROM embeddings e
+                       WHERE e.memory_id IN (
+                           SELECT bl.member_id
+                           FROM boundary_layers bl
+                           GROUP BY bl.member_id
+                           HAVING CAST(SUM(bl.is_edge) AS REAL) / COUNT(*) > 0.5
+                       )"""
+                ).fetchall()
+
+            if not edge_rows:
+                return {cid: 0.0 for cid in chain_vecs}
+
+            edge_vecs = np.stack([decode_vector(bytes(r["vector"])) for r in edge_rows])
+
+            # 各 chain embedding と edge embeddings の max cosine similarity
+            result: dict[str, float] = {}
+            for cid, cvec in chain_vecs.items():
+                sims = cosine_similarity(cvec, edge_vecs)
+                result[cid] = float(np.max(sims))
+
+            return result
+
+        return await asyncio.to_thread(_calc)
+
+    async def find_adjacent_composites(
+        self,
+        composite_id: str,
+        query_vec: np.ndarray,
+        n_results: int = 3,
+    ) -> list[tuple[str, float]]:
+        """composite の edge メンバーの平均ベクトルから隣接 composite を発見。
+
+        Returns: [(adjacent_composite_id, similarity), ...] 自身を除外。
+        """
+        db = self._ensure_connected()
+
+        def _find() -> list[tuple[str, float]]:
+            # 1. edge メンバー（layer_index=0, is_edge=1）のベクトルを取得
+            edge_rows = db.execute(
+                """SELECT e.vector
+                   FROM boundary_layers bl
+                   JOIN embeddings e ON e.memory_id = bl.member_id
+                   WHERE bl.composite_id = ? AND bl.layer_index = 0 AND bl.is_edge = 1""",
+                (composite_id,),
+            ).fetchall()
+            if not edge_rows:
+                return []
+
+            # edge ベクトルの平均
+            edge_vecs = [decode_vector(bytes(r["vector"])) for r in edge_rows]
+            edge_mean = np.mean(edge_vecs, axis=0)
+
+            # 2. 他の全 composite（level=1）のベクトルを取得
+            other_rows = db.execute(
+                """SELECT e.memory_id, e.vector
+                   FROM embeddings e
+                   JOIN memories m ON m.id = e.memory_id
+                   WHERE m.level = 1 AND e.memory_id != ?""",
+                (composite_id,),
+            ).fetchall()
+            if not other_rows:
+                return []
+
+            # 3. cosine similarity でランク
+            candidates: list[tuple[str, float]] = []
+            for row in other_rows:
+                other_vec = decode_vector(bytes(row["vector"]))
+                sim = float(cosine_similarity(edge_mean, other_vec))
+                candidates.append((row["memory_id"], sim))
+
+            candidates.sort(key=lambda x: x[1], reverse=True)
+            return candidates[:n_results]
+
+        return await asyncio.to_thread(_find)
+
+    async def expand_composite_edges(
+        self,
+        composite_ids: list[str],
+        query_vec: np.ndarray,
+    ) -> list[Memory]:
+        """composite の edge メンバーと隣接 composite の edge メンバーを展開して返す。"""
+        if not composite_ids:
+            return []
+
+        all_member_ids: set[str] = set()
+
+        for cid in composite_ids:
+            db = self._ensure_connected()
+
+            # edge メンバーを取得
+            def _get_edges(comp_id: str = cid) -> list[str]:
+                rows = db.execute(
+                    """SELECT bl.member_id
+                       FROM boundary_layers bl
+                       WHERE bl.composite_id = ? AND bl.layer_index = 0 AND bl.is_edge = 1""",
+                    (comp_id,),
+                ).fetchall()
+                return [row["member_id"] for row in rows]
+
+            edge_ids = await asyncio.to_thread(_get_edges)
+            all_member_ids.update(edge_ids)
+
+            # 隣接 composite を発見
+            adjacent = await self.find_adjacent_composites(cid, query_vec, n_results=3)
+            for adj_id, _sim in adjacent:
+                def _get_adj_edges(comp_id: str = adj_id) -> list[str]:
+                    rows = db.execute(
+                        """SELECT bl.member_id
+                           FROM boundary_layers bl
+                           WHERE bl.composite_id = ? AND bl.layer_index = 0 AND bl.is_edge = 1""",
+                        (comp_id,),
+                    ).fetchall()
+                    return [row["member_id"] for row in rows]
+
+                adj_edge_ids = await asyncio.to_thread(_get_adj_edges)
+                all_member_ids.update(adj_edge_ids)
+
+        if not all_member_ids:
+            return []
+
+        return await self.get_by_ids(list(all_member_ids))
+
+    async def fetch_verb_chain_templates(
+        self,
+    ) -> list[tuple[str, np.ndarray, list[str], list[str]]]:
+        """全VerbChainの(chain_id, vector, verbs_list, nouns_list)を取得。"""
+        db = self._ensure_connected()
+
+        def _fetch() -> list[tuple[str, bytes, str, str]]:
+            rows = db.execute(
+                """SELECT vc.id, vce.vector, vc.all_verbs, vc.all_nouns
+                   FROM verb_chains vc
+                   JOIN verb_chain_embeddings vce ON vce.chain_id = vc.id"""
+            ).fetchall()
+            return [
+                (row["id"], bytes(row["vector"]), row["all_verbs"], row["all_nouns"])
+                for row in rows
+            ]
+
+        raw = await asyncio.to_thread(_fetch)
+        results: list[tuple[str, np.ndarray, list[str], list[str]]] = []
+        for chain_id, blob, verbs_str, nouns_str in raw:
+            vec = decode_vector(blob)
+            verbs = [v.strip() for v in verbs_str.split(",") if v.strip()]
+            nouns = [n.strip() for n in nouns_str.split(",") if n.strip()]
+            results.append((chain_id, vec, verbs, nouns))
+        return results
 
     # ── Hopfield ─────────────────────────────────
 

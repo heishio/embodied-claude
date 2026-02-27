@@ -68,17 +68,33 @@ class VerbChainStore:
             for noun in step.nouns:
                 self._noun_to_chain_ids[noun].add(chain.id)
 
-    async def save(self, chain: VerbChain) -> VerbChain:
+    async def save(self, chain: VerbChain, category_id: int | None = None) -> VerbChain:
         """チェーンをSQLiteに保存."""
         document = chain.to_document()
         meta = chain.to_metadata()
 
         def _insert() -> None:
+            # Decay freshness only for post-consolidation memories
+            cutoff = self._db.execute(
+                "SELECT COALESCE((SELECT value FROM meta WHERE key = 'last_consolidated_at'), '')"
+            ).fetchone()[0]
+            if cutoff:
+                self._db.execute(
+                    "UPDATE memories SET freshness = MAX(0.01, freshness - 0.003) WHERE timestamp > ?",
+                    (cutoff,),
+                )
+                self._db.execute(
+                    "UPDATE verb_chains SET freshness = MAX(0.01, freshness - 0.003) WHERE timestamp > ?",
+                    (cutoff,),
+                )
+            else:
+                self._db.execute("UPDATE memories SET freshness = MAX(0.01, freshness - 0.003)")
+                self._db.execute("UPDATE verb_chains SET freshness = MAX(0.01, freshness - 0.003)")
             self._db.execute(
                 """INSERT OR IGNORE INTO verb_chains
                    (id, document, steps_json, all_verbs, all_nouns,
-                    timestamp, emotion, importance, source, context)
-                   VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                    timestamp, emotion, importance, source, context, category_id, freshness)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     chain.id,
                     document,
@@ -90,6 +106,8 @@ class VerbChainStore:
                     meta["importance"],
                     meta["source"],
                     meta["context"],
+                    category_id,
+                    1.0,
                 ),
             )
             # 埋め込みを保存
@@ -110,24 +128,48 @@ class VerbChainStore:
             nouns_per_step = [list(step.nouns) for step in chain.steps]
             await self._graph.register_chain(verbs, nouns_per_step)
 
+            # Assign nodes to category if specified
+            if category_id is not None:
+                await self._graph.assign_chain_nodes_to_category(
+                    verbs, nouns_per_step, category_id
+                )
+
         return chain
 
     async def search(
         self,
         query: str,
         n_results: int = 5,
+        category_id: int | None = None,
     ) -> list[tuple[VerbChain, float]]:
         """意味的類似度でチェーンを検索（スコアリング付き）."""
 
         def _search_db() -> list[tuple[VerbChain, float]]:
-            # 全チェーン+埋め込みを取得
-            rows = self._db.execute(
-                """SELECT vc.id, vc.document, vc.steps_json, vc.all_verbs, vc.all_nouns,
-                          vc.timestamp, vc.emotion, vc.importance, vc.source, vc.context,
-                          vce.vector
-                   FROM verb_chains vc
-                   JOIN verb_chain_embeddings vce ON vc.id = vce.chain_id"""
-            ).fetchall()
+            # チェーン+埋め込みを取得（カテゴリフィルタ対応）
+            if category_id is not None:
+                rows = self._db.execute(
+                    """WITH RECURSIVE cat_tree(id) AS (
+                           SELECT id FROM categories WHERE id = ?
+                           UNION ALL
+                           SELECT c.id FROM categories c
+                           JOIN cat_tree ct ON c.parent_id = ct.id
+                       )
+                       SELECT vc.id, vc.document, vc.steps_json, vc.all_verbs, vc.all_nouns,
+                              vc.timestamp, vc.emotion, vc.importance, vc.source, vc.context,
+                              vce.vector, vc.freshness
+                       FROM verb_chains vc
+                       JOIN verb_chain_embeddings vce ON vc.id = vce.chain_id
+                       WHERE vc.category_id IN (SELECT id FROM cat_tree)""",
+                    (category_id,),
+                ).fetchall()
+            else:
+                rows = self._db.execute(
+                    """SELECT vc.id, vc.document, vc.steps_json, vc.all_verbs, vc.all_nouns,
+                              vc.timestamp, vc.emotion, vc.importance, vc.source, vc.context,
+                              vce.vector, vc.freshness
+                       FROM verb_chains vc
+                       JOIN verb_chain_embeddings vce ON vc.id = vce.chain_id"""
+                ).fetchall()
 
             if not rows:
                 return []
@@ -149,6 +191,7 @@ class VerbChainStore:
                     "importance": row[7],
                     "source": row[8],
                     "context": row[9],
+                    "freshness": row[11] if len(row) > 11 else 1.0,
                 }
                 chains.append(VerbChain.from_metadata(chain_id, metadata))
                 vecs.append(decode_vector(row[10]))
@@ -206,12 +249,14 @@ class VerbChainStore:
         noun: str | None = None,
         depth: int = 2,
         n_results: int = 20,
-    ) -> list[VerbChain]:
+        category_id: int | None = None,
+    ) -> tuple[list[VerbChain], list[str], list[str]]:
         """1つの動詞/名詞から関連チェーンを発見.
 
         グラフがある場合: weight上位のノードをdepth段展開し、
         到達したノードから転置インデックスでチェーンID収集、weight順にスコアリング。
         グラフがない場合: 旧実装（芋づる式全展開）にフォールバック。
+        category_id指定時: グラフ探索もチェーン取得もカテゴリでフィルタ。
         """
         if self._graph is None:
             return await self._expand_from_fragment_legacy(verb=verb, noun=noun, depth=depth)
@@ -241,7 +286,8 @@ class VerbChainStore:
             next_nodes: list[tuple[str, str]] = []
             for node_type, surface_form in current_nodes:
                 neighbors = await self._graph.query_neighbors(
-                    node_type, surface_form, limit=10
+                    node_type, surface_form, limit=10,
+                    category_id=category_id,
                 )
                 parent_score = node_scores.get((node_type, surface_form), 0.0)
                 for n_type, n_form, weight in neighbors:
@@ -268,20 +314,55 @@ class VerbChainStore:
                     chain_id_scores[cid] = max(chain_id_scores.get(cid, 0.0), score)
 
         if not chain_id_scores:
-            return []
+            return [], [], []
 
         # Sort by score descending, take top n_results
         sorted_ids = sorted(chain_id_scores.items(), key=lambda x: x[1], reverse=True)
         top_ids = [cid for cid, _ in sorted_ids[:n_results]]
 
-        return await self._get_chains_by_ids(top_ids)
+        chains = await self._get_chains_by_ids(top_ids)
+
+        # Filter by category_id at the chain level if specified
+        if category_id is not None:
+            cat_ids = self._get_descendant_category_ids(category_id)
+            chains = [c for c in chains if self._chain_has_category(c.id, cat_ids)]
+
+        # Extract visited verbs and nouns from expansion path
+        v_verbs = [sf for t, sf in visited_nodes if t == "verb"]
+        v_nouns = [sf for t, sf in visited_nodes if t == "noun"]
+        return chains, v_verbs, v_nouns
+
+    def _get_descendant_category_ids(self, category_id: int) -> set[int]:
+        """Get category_id and all its descendants via recursive CTE."""
+        rows = self._db.execute(
+            """WITH RECURSIVE cat_tree(id) AS (
+                   SELECT id FROM categories WHERE id = ?
+                   UNION ALL
+                   SELECT c.id FROM categories c
+                   JOIN cat_tree ct ON c.parent_id = ct.id
+               )
+               SELECT id FROM cat_tree""",
+            (category_id,),
+        ).fetchall()
+        return {int(r[0]) if isinstance(r, tuple) else int(r["id"]) for r in rows}
+
+    def _chain_has_category(self, chain_id: str, cat_ids: set[int]) -> bool:
+        """Check if a chain's category_id is in the given set."""
+        row = self._db.execute(
+            "SELECT category_id FROM verb_chains WHERE id = ?",
+            (chain_id,),
+        ).fetchone()
+        if row is None:
+            return False
+        cid = row[0] if isinstance(row, tuple) else row["category_id"]
+        return cid is not None and int(cid) in cat_ids
 
     async def _expand_from_fragment_legacy(
         self,
         verb: str | None = None,
         noun: str | None = None,
         depth: int = 2,
-    ) -> list[VerbChain]:
+    ) -> tuple[list[VerbChain], list[str], list[str]]:
         """Legacy: 転置インデックスのみの芋づる式展開（グラフなし時のフォールバック）."""
         depth = max(1, min(5, depth))
         visited_chain_ids: set[str] = set()
@@ -319,7 +400,18 @@ class VerbChainStore:
 
             current_ids = next_ids - visited_chain_ids
 
-        return result_chains
+        # Extract visited verbs and nouns from result chains + seeds
+        all_verbs: set[str] = set()
+        all_nouns: set[str] = set()
+        if verb:
+            all_verbs.add(verb)
+        if noun:
+            all_nouns.add(noun)
+        for chain in result_chains:
+            for step in chain.steps:
+                all_verbs.add(step.verb)
+                all_nouns.update(step.nouns)
+        return result_chains, list(all_verbs), list(all_nouns)
 
     async def _get_chains_by_ids(self, chain_ids: list[str]) -> list[VerbChain]:
         """IDリストからチェーンを取得."""
@@ -330,7 +422,7 @@ class VerbChainStore:
             placeholders = ",".join("?" for _ in chain_ids)
             rows = self._db.execute(
                 f"""SELECT id, document, steps_json, all_verbs, all_nouns,
-                           timestamp, emotion, importance, source, context
+                           timestamp, emotion, importance, source, context, freshness
                     FROM verb_chains WHERE id IN ({placeholders})""",
                 chain_ids,
             ).fetchall()
@@ -346,6 +438,7 @@ class VerbChainStore:
                     "importance": row[7] if isinstance(row, tuple) else row["importance"],
                     "source": row[8] if isinstance(row, tuple) else row["source"],
                     "context": row[9] if isinstance(row, tuple) else row["context"],
+                    "freshness": (row[10] if isinstance(row, tuple) else row["freshness"]) or 1.0,
                 }
                 chain_id = row[0] if isinstance(row, tuple) else row["id"]
                 chains.append(VerbChain.from_metadata(chain_id, metadata))
@@ -359,7 +452,7 @@ class VerbChainStore:
         def _fetch_all() -> list[VerbChain]:
             rows = self._db.execute(
                 """SELECT id, document, steps_json, all_verbs, all_nouns,
-                          timestamp, emotion, importance, source, context
+                          timestamp, emotion, importance, source, context, freshness
                    FROM verb_chains"""
             ).fetchall()
 
@@ -374,6 +467,7 @@ class VerbChainStore:
                     "importance": row[7] if isinstance(row, tuple) else row["importance"],
                     "source": row[8] if isinstance(row, tuple) else row["source"],
                     "context": row[9] if isinstance(row, tuple) else row["context"],
+                    "freshness": (row[10] if isinstance(row, tuple) else row["freshness"]) or 1.0,
                 }
                 chain_id = row[0] if isinstance(row, tuple) else row["id"]
                 chains.append(VerbChain.from_metadata(chain_id, metadata))
@@ -384,7 +478,7 @@ class VerbChainStore:
 
 def crystallize_buffer(
     entries: list[dict[str, Any]],
-    emotion: str = "neutral",
+    emotion: str = "8",
     importance: int = 3,
     min_verbs: int = 2,
 ) -> list[VerbChain]:
