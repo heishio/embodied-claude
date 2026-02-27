@@ -15,6 +15,13 @@ if TYPE_CHECKING:
     from .memory import MemoryStore
     from .types import Memory
 
+# ── Bias Update Constants ──────────────────────
+BIAS_ACCUMULATION_RATE = 0.01    # バイアス蓄積レート（控えめ）
+BIAS_MAX_CAP = 0.15              # 単一バイアスの上限
+BIAS_DECAY_FACTOR = 0.90         # コンソリデーション毎の減衰率
+BIAS_PRUNE_THRESHOLD = 0.001    # この値以下のバイアスを刈り取り
+BIAS_APPLY_COEFFICIENT = 0.05   # recall時のノイズ適用係数
+
 
 @dataclass(frozen=True)
 class ConsolidationStats:
@@ -209,33 +216,46 @@ class ConsolidationEngine:
         noise_scale: float = 0.1,
         max_template_strength: float = 0.3,
     ) -> dict[str, int]:
-        """外縁検出 + ノイズレイヤー生成。
+        """外縁検出 + ノイズレイヤー生成 + バイアス蓄積。
 
         各 composite について:
         - Layer 0: ノイズなしで edge/core を分類
         - Layer 1..n_layers: 体験チェーンベースのノイズで edge/core を再分類
 
         Returns:
-            {"composites_processed": int, "total_layers": int}
+            {"composites_processed": int, "total_layers": int,
+             "biases_updated": int, "biases_decayed": int, "biases_pruned": int}
         """
         composite_ids = await store.fetch_all_composite_ids()
         if not composite_ids:
-            return {"composites_processed": 0, "total_layers": 0}
+            return {
+                "composites_processed": 0, "total_layers": 0,
+                "biases_updated": 0, "biases_decayed": 0, "biases_pruned": 0,
+            }
 
-        # テンプレート生成（全composite共通）
-        templates: list[tuple[np.ndarray, float]] = []
+        # 1. バイアス減衰（蓄積より先に行う）
+        decay_stats = await self._decay_biases(store)
+
+        # 2. 既存バイアスを取得
+        existing_biases = await store.fetch_template_biases()
+
+        # テンプレート生成（全composite共通） — 3-tuple: (vec, transient_strength, bias_weight)
+        templates: list[tuple[np.ndarray, float, float, str]] = []  # (vec, transient, bias, chain_id)
         if graph is not None:
             raw_templates = await store.fetch_verb_chain_templates()
-            for _chain_id, vec, verbs, nouns in raw_templates:
+            for chain_id, vec, verbs, nouns in raw_templates:
                 raw_strength = await graph.get_path_strength(verbs, nouns)
                 strength = min(raw_strength, max_template_strength)
                 if strength > 0:
-                    templates.append((vec, strength))
+                    bias = existing_biases.get(chain_id, 0.0)
+                    templates.append((vec, strength, bias, chain_id))
 
         await store.clear_boundary_layers()
 
         composites_processed = 0
         total_layers = 0
+        # 各compositeのlayer0分類を記録（バイアス更新用）
+        composite_layer0_map: dict[str, list[int]] = {}
 
         for cid in composite_ids:
             members = await store.fetch_composite_with_vectors(cid)
@@ -251,11 +271,13 @@ class ConsolidationEngine:
 
             # ── Layer 0: ノイズなし ──
             layer0 = self._classify_edge_core(member_vecs, centroid)
+            composite_layer0_map[cid] = layer0
             all_layers: list[tuple[str, int, int]] = []
             for i, mid in enumerate(member_ids):
                 all_layers.append((mid, 0, layer0[i]))
 
             # ── Layer 1..n_layers: ノイズ適用 ──
+            layer_classifications: list[list[int]] = []
             for layer_idx in range(1, n_layers + 1):
                 noised_vecs = self._apply_noise(
                     member_vecs, templates, noise_scale, layer_idx,
@@ -266,6 +288,7 @@ class ConsolidationEngine:
                 noised_centroid = noised_centroid / norm
 
                 layer_classes = self._classify_edge_core(noised_vecs, noised_centroid)
+                layer_classifications.append(layer_classes)
                 for i, mid in enumerate(member_ids):
                     all_layers.append((mid, layer_idx, layer_classes[i]))
 
@@ -273,9 +296,17 @@ class ConsolidationEngine:
             composites_processed += 1
             total_layers += 1 + n_layers
 
+        # 3. バイアス蓄積
+        biases_updated = await self._update_biases(
+            store, templates, composite_layer0_map, n_layers, existing_biases,
+        )
+
         return {
             "composites_processed": composites_processed,
             "total_layers": total_layers,
+            "biases_updated": biases_updated,
+            "biases_decayed": decay_stats.get("biases_decayed", 0),
+            "biases_pruned": decay_stats.get("biases_pruned", 0),
         }
 
     def _classify_edge_core(
@@ -293,11 +324,16 @@ class ConsolidationEngine:
     def _apply_noise(
         self,
         member_vecs: np.ndarray,
-        templates: list[tuple[np.ndarray, float]],
+        templates: list[tuple[np.ndarray, float, float, str]],
         noise_scale: float,
         seed: int,
+        max_template_strength: float = 0.3,
     ) -> np.ndarray:
-        """テンプレートベースのノイズを適用。テンプレートがなければランダムノイズ。"""
+        """テンプレートベースのノイズを適用。テンプレートがなければランダムノイズ。
+
+        templates: list of (vec, transient_strength, bias_weight, chain_id)
+        effective_strength = min(transient + BIAS_APPLY_COEFFICIENT * bias, max_template_strength)
+        """
         rng = np.random.default_rng(seed)
         n_members = member_vecs.shape[0]
         dim = member_vecs.shape[1]
@@ -313,18 +349,99 @@ class ConsolidationEngine:
         noised = member_vecs.copy()
         m_norms = member_vecs / (np.linalg.norm(member_vecs, axis=1, keepdims=True) + 1e-10)
 
-        for t_vec, strength in templates:
+        for t_vec, transient_strength, bias_weight, _chain_id in templates:
+            effective_strength = min(
+                transient_strength + BIAS_APPLY_COEFFICIENT * bias_weight,
+                max_template_strength,
+            )
             alpha = rng.normal(0, 1)
             t_norm = t_vec / (np.linalg.norm(t_vec) + 1e-10)
-            # cos(T_k, v_i) for each member
             alignments = m_norms @ t_norm  # shape: (n_members,)
-            # ε_i = strength * α * cos(T, v_i) * T * noise_scale
             for i in range(n_members):
-                noised[i] += strength * alpha * float(alignments[i]) * t_norm * noise_scale
+                noised[i] += effective_strength * alpha * float(alignments[i]) * t_norm * noise_scale
 
         # 正規化
         norms = np.linalg.norm(noised, axis=1, keepdims=True) + 1e-10
         return noised / norms
+
+    async def _decay_biases(self, store: "MemoryStore") -> dict[str, int]:
+        """バイアスを減衰・刈り取り。"""
+        return await store.decay_template_biases(BIAS_DECAY_FACTOR, BIAS_PRUNE_THRESHOLD)
+
+    async def _update_biases(
+        self,
+        store: "MemoryStore",
+        templates: list[tuple[np.ndarray, float, float, str]],
+        composite_layer0_map: dict[str, list[int]],
+        n_layers: int,
+        existing_biases: dict[str, float],
+    ) -> int:
+        """各テンプレートのバイアスを蓄積する。
+
+        composite毎にlayer 0 vs layer k の分類変化（ハミング距離 / メンバー数）を計算し、
+        テンプレートのtransient_strengthの割合で按分して蓄積。
+        """
+        if not templates or not composite_layer0_map or n_layers == 0:
+            return 0
+
+        db = store._ensure_connected()
+
+        # 全compositeの平均シフトを計算
+        overall_shifts: list[float] = []
+        for cid, layer0 in composite_layer0_map.items():
+            n_members = len(layer0)
+            if n_members == 0:
+                continue
+            # 各レイヤーのlayer0との分類差を取得
+            for layer_idx in range(1, n_layers + 1):
+                rows = db.execute(
+                    """SELECT member_id, is_edge FROM boundary_layers
+                       WHERE composite_id = ? AND layer_index = ?
+                       ORDER BY member_id""",
+                    (cid, layer_idx),
+                ).fetchall()
+                if len(rows) != n_members:
+                    continue
+                layer0_rows = db.execute(
+                    """SELECT member_id, is_edge FROM boundary_layers
+                       WHERE composite_id = ? AND layer_index = 0
+                       ORDER BY member_id""",
+                    (cid,),
+                ).fetchall()
+                # ハミング距離
+                hamming = sum(
+                    1 for l0, lk in zip(layer0_rows, rows)
+                    if l0["is_edge"] != lk["is_edge"]
+                )
+                shift = hamming / n_members
+                overall_shifts.append(shift)
+
+        if not overall_shifts:
+            return 0
+
+        avg_shift = sum(overall_shifts) / len(overall_shifts)
+
+        # テンプレート毎のバイアス更新
+        sum_strengths = sum(t[1] for t in templates)
+        if sum_strengths <= 0:
+            return 0
+
+        bias_updates: list[tuple[str, float, int]] = []
+        for _vec, transient_strength, bias_weight, chain_id in templates:
+            proportion = transient_strength / sum_strengths
+            shift_contribution = proportion * avg_shift
+            old_bias = existing_biases.get(chain_id, 0.0)
+            new_bias = min(BIAS_MAX_CAP, old_bias + BIAS_ACCUMULATION_RATE * shift_contribution)
+            # update_count を既存の値から取得
+            row = db.execute(
+                "SELECT update_count FROM template_biases WHERE chain_id = ?",
+                (chain_id,),
+            ).fetchone()
+            old_count = row["update_count"] if row else 0
+            bias_updates.append((chain_id, new_bias, old_count + 1))
+
+        await store.save_template_biases(bias_updates)
+        return len(bias_updates)
 
     def _is_after(self, memory: "Memory", cutoff: datetime) -> bool:
         try:

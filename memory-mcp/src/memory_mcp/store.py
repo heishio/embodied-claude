@@ -196,6 +196,14 @@ CREATE TABLE IF NOT EXISTS meta (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS template_biases (
+    chain_id TEXT NOT NULL,
+    bias_weight REAL NOT NULL DEFAULT 0.0,
+    update_count INTEGER NOT NULL DEFAULT 0,
+    last_updated TEXT NOT NULL,
+    PRIMARY KEY (chain_id)
+);
 """
 
 # ──────────────────────────────────────────────
@@ -390,6 +398,15 @@ class MemoryStore:
                             PRIMARY KEY (composite_id, member_id, layer_index)
                         )""")
                         conn.execute("CREATE INDEX IF NOT EXISTS idx_boundary_layers_composite ON boundary_layers(composite_id)")
+                    # Migration: create template_biases table if missing
+                    if "template_biases" not in existing_tables:
+                        conn.execute("""CREATE TABLE IF NOT EXISTS template_biases (
+                            chain_id TEXT NOT NULL,
+                            bias_weight REAL NOT NULL DEFAULT 0.0,
+                            update_count INTEGER NOT NULL DEFAULT 0,
+                            last_updated TEXT NOT NULL,
+                            PRIMARY KEY (chain_id)
+                        )""")
                     conn.commit()
                     return conn
 
@@ -2182,6 +2199,61 @@ class MemoryStore:
             nouns = [n.strip() for n in nouns_str.split(",") if n.strip()]
             results.append((chain_id, vec, verbs, nouns))
         return results
+
+    # ── Template Biases ──────────────────────────
+
+    async def fetch_template_biases(self) -> dict[str, float]:
+        """全バイアスを {chain_id: bias_weight} で返す。"""
+        db = self._ensure_connected()
+
+        def _fetch() -> dict[str, float]:
+            rows = db.execute("SELECT chain_id, bias_weight FROM template_biases").fetchall()
+            return {row["chain_id"]: row["bias_weight"] for row in rows}
+
+        return await asyncio.to_thread(_fetch)
+
+    async def save_template_biases(self, biases: list[tuple[str, float, int]]) -> None:
+        """バッチ upsert (chain_id, bias_weight, update_count)。"""
+        if not biases:
+            return
+        db = self._ensure_connected()
+        now = datetime.now(timezone.utc).isoformat()
+
+        def _save() -> None:
+            db.executemany(
+                """INSERT INTO template_biases (chain_id, bias_weight, update_count, last_updated)
+                   VALUES (?, ?, ?, ?)
+                   ON CONFLICT(chain_id) DO UPDATE SET
+                       bias_weight = excluded.bias_weight,
+                       update_count = excluded.update_count,
+                       last_updated = excluded.last_updated""",
+                [(cid, weight, count, now) for cid, weight, count in biases],
+            )
+            db.commit()
+
+        await asyncio.to_thread(_save)
+
+    async def decay_template_biases(
+        self, factor: float, prune_threshold: float
+    ) -> dict[str, int]:
+        """全バイアスを factor 倍に減衰し、prune_threshold 以下を刈り取る。"""
+        db = self._ensure_connected()
+
+        def _decay() -> dict[str, int]:
+            db.execute(
+                "UPDATE template_biases SET bias_weight = bias_weight * ?",
+                (factor,),
+            )
+            cursor = db.execute(
+                "DELETE FROM template_biases WHERE bias_weight <= ?",
+                (prune_threshold,),
+            )
+            pruned = cursor.rowcount
+            remaining = db.execute("SELECT COUNT(*) FROM template_biases").fetchone()[0]
+            db.commit()
+            return {"biases_decayed": remaining + pruned, "biases_pruned": pruned}
+
+        return await asyncio.to_thread(_decay)
 
     # ── Hopfield ─────────────────────────────────
 
