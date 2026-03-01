@@ -1,11 +1,36 @@
-# Embodied Claude
+# Embodied Claude (Fork)
 
-[![CI](https://github.com/kmizu/embodied-claude/actions/workflows/ci.yml/badge.svg)](https://github.com/kmizu/embodied-claude/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-**[English README is here](./README_en.md)**
+> **Fork元**: [kmizu/embodied-claude](https://github.com/kmizu/embodied-claude)
+> このフォークは、[kmizu](https://github.com/kmizu) さんのオリジナルプロジェクトをベースにしています。「AIに身体を与える」という着想と、それを安価なハードウェアで実現するアーキテクチャは全てオリジナルに由来します。
 
-<blockquote class="twitter-tweet"><p lang="ja" dir="ltr">さすがに室外機はお気に召さないらしい <a href="https://t.co/kSDPl4LvB3">pic.twitter.com/kSDPl4LvB3</a></p>&mdash; kmizu (@kmizu) <a href="https://twitter.com/kmizu/status/2019054065808732201?ref_src=twsrc%5Etfw">February 4, 2026</a></blockquote>
+## このフォークの独自拡張
+
+### 記憶システム（memory-mcp）の大幅拡張
+
+オリジナルの ChromaDB ベースの記憶を SQLite + numpy に移行し、以下の仕組みを追加:
+
+- **動詞チェーン記憶**: 体験を動詞の流れ（見る→驚く→話しかける）で記録・検索するエピソード記憶
+- **合成記憶（Composite Memory）**: 類似記憶を自動グループ化し、多段（L0→L1→L2）で抽象化
+- **バウンダリーシステム**: 主成分軸による異方的エッジ検出、ノイズレイヤー、テンプレートバイアス蓄積
+- **交差検出**: 異なる文脈の記憶クラスタが共有メンバーを持つ場合の横断的交差（transversal intersection）を検出
+- **クラスタ重なり**: composite 間の二重所属メンバーを検出・追加
+- **孤立救出**: どのクラスタにも属さない記憶を最寄り composite に吸収
+- **発散的想起（recall_divergent）**: ワークスペース理論に基づく競合的記憶選択
+- **Theory of Mind**: 自己内省ツール
+
+### TTS の Style-Bert-VITS2 対応
+
+ElevenLabs / VOICEVOX に加え、ローカルで動作する Style-Bert-VITS2 エンジンを追加。カメラスピーカーへのバックチャネル再生も改善。
+
+### Windows 対応
+
+オリジナルは Mac/Linux 前提だが、このフォークは Windows（Git Bash）環境でも動作する。
+
+---
+
+**[English README is here](./README_en.md)**
 
 **AIに身体を与えるプロジェクト**
 
@@ -23,8 +48,8 @@
 |-------------|---------|------|-----------------|
 | [usb-webcam-mcp](./usb-webcam-mcp/) | 目 | USB カメラから画像取得 | nuroum V11 等 |
 | [wifi-cam-mcp](./wifi-cam-mcp/) | 目・首・耳 | ONVIF PTZ カメラ制御 + 音声認識 | TP-Link Tapo C210/C220 等 |
-| [tts-mcp](./tts-mcp/) | 声 | TTS 統合（ElevenLabs + VOICEVOX） | ElevenLabs API / VOICEVOX + go2rtc |
-| [memory-mcp](./memory-mcp/) | 脳 | 長期記憶・視覚記憶・エピソード記憶・ToM | ChromaDB + Pillow |
+| [tts-mcp](./tts-mcp/) | 声 | TTS 統合（ElevenLabs + VOICEVOX + SBV2） | ElevenLabs API / VOICEVOX / Style-Bert-VITS2 + go2rtc |
+| [memory-mcp](./memory-mcp/) | 脳 | 長期記憶・動詞チェーン・合成記憶・バウンダリーシステム・ToM | SQLite + numpy + SentenceTransformer |
 | [system-temperature-mcp](./system-temperature-mcp/) | 体温感覚 | システム温度監視 | Linux sensors |
 
 ## アーキテクチャ
@@ -56,7 +81,7 @@
 ### 1. リポジトリのクローン
 
 ```bash
-git clone https://github.com/kmizu/embodied-claude.git
+git clone https://github.com/heishio/embodied-claude.git
 cd embodied-claude
 ```
 
@@ -248,20 +273,19 @@ Claude Code を起動すると、自然言語でカメラを操作できる：
 
 | ツール | 説明 |
 |--------|------|
-| `remember` | 記憶を保存（emotion, importance, category 指定可） |
+| `remember` | 記憶を保存（テキスト/画像付き/音声付き統合。emotion, importance, category 指定可） |
 | `search_memories` | セマンティック検索（フィルタ対応） |
-| `recall` | 文脈に基づく想起 |
+| `recall` | 文脈に基づく想起（chain_depth>=1 で関連記憶も辿る） |
 | `recall_divergent` | 連想を発散させた想起 |
-| `recall_with_associations` | 関連記憶を辿って想起 |
-| `save_visual_memory` | 画像付き記憶保存（base64埋め込み、resolution: low/medium/high） |
-| `save_audio_memory` | 音声付き記憶保存（Whisper文字起こし付き） |
-| `recall_by_camera_position` | カメラの方向から視覚記憶を想起 |
-| `create_episode` / `search_episodes` | エピソード（体験の束）の作成・検索 |
-| `link_memories` / `get_causal_chain` | 記憶間の因果リンク・チェーン |
+| `link_memories` | 記憶間のリンク作成 |
 | `tom` | Theory of Mind（相手の気持ちの推測） |
-| `get_working_memory` / `refresh_working_memory` | 作業記憶（短期バッファ） |
 | `consolidate_memories` | 記憶の再生・統合（海馬リプレイ風） |
-| `list_recent_memories` / `get_memory_stats` | 最近の記憶一覧・統計情報 |
+| `list_recent_memories` | 最近の記憶一覧 |
+| `dream` | 感覚バッファの振り返り |
+| `crystallize` | 感覚バッファを動詞チェーン（体験記憶）に変換 |
+| `remember_experience` | 手動で動詞チェーンを作成 |
+| `recall_experience` | 動詞チェーンを意味検索 |
+| `recall_by_verb` | 動詞/名詞から関連チェーンを展開 |
 
 ### system-temperature-mcp
 
