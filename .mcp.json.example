@@ -17,7 +17,7 @@
       "command": "uv",
       "args": ["run", "--directory", "memory-mcp", "memory-mcp"],
       "env": {
-        "TOM_DEFAULT_PERSON": "シオ"
+        "TOM_DEFAULT_PERSON": "name"
       }
     },
     "system-temperature": {

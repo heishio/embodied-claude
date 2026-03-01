@@ -12,9 +12,9 @@ from memory_mcp.verb_chain import VerbChainStore, crystallize_buffer
 @pytest.fixture
 def sample_steps():
     return (
-        VerbStep(verb="見る", nouns=("シオ", "画面")),
+        VerbStep(verb="見る", nouns=("コウタ", "画面")),
         VerbStep(verb="驚く", nouns=("音",)),
-        VerbStep(verb="話しかける", nouns=("シオ",)),
+        VerbStep(verb="話しかける", nouns=("コウタ",)),
     )
 
 
@@ -36,15 +36,15 @@ def sample_chain(sample_steps):
 
 class TestVerbStep:
     def test_to_text_with_nouns(self):
-        step = VerbStep(verb="見る", nouns=("シオ", "画面"))
-        assert step.to_text() == "見る(シオ, 画面)"
+        step = VerbStep(verb="見る", nouns=("コウタ", "画面"))
+        assert step.to_text() == "見る(コウタ, 画面)"
 
     def test_to_text_without_nouns(self):
         step = VerbStep(verb="驚く", nouns=())
         assert step.to_text() == "驚く"
 
     def test_to_dict_roundtrip(self):
-        step = VerbStep(verb="話す", nouns=("シオ",))
+        step = VerbStep(verb="話す", nouns=("コウタ",))
         restored = VerbStep.from_dict(step.to_dict())
         assert restored == step
 
@@ -55,7 +55,7 @@ class TestVerbStep:
 class TestVerbChain:
     def test_to_document(self, sample_chain):
         doc = sample_chain.to_document()
-        assert "見る(シオ, 画面)" in doc
+        assert "見る(コウタ, 画面)" in doc
         assert "→" in doc
         assert "テスト用体験" in doc
 
@@ -77,7 +77,7 @@ class TestVerbChain:
     def test_all_nouns_in_metadata(self, sample_chain):
         metadata = sample_chain.to_metadata()
         nouns = set(metadata["all_nouns"].split(","))
-        assert "シオ" in nouns
+        assert "コウタ" in nouns
         assert "画面" in nouns
         assert "音" in nouns
 
@@ -90,20 +90,20 @@ class TestCrystallizeBuffer:
         assert crystallize_buffer([]) == []
 
     def test_single_entry_below_min(self):
-        entries = [{"v": ["見る"], "w": ["シオ"]}]
+        entries = [{"v": ["見る"], "w": ["コウタ"]}]
         chains = crystallize_buffer(entries, min_verbs=2)
         assert chains == []
 
     def test_single_entry_meets_min(self):
-        entries = [{"v": ["見る", "思う"], "w": ["シオ"]}]
+        entries = [{"v": ["見る", "思う"], "w": ["コウタ"]}]
         chains = crystallize_buffer(entries, min_verbs=2)
         assert len(chains) == 1
         assert len(chains[0].steps) == 2
 
     def test_grouping_by_shared_nouns(self):
         entries = [
-            {"v": ["見る"], "w": ["シオ", "画面"]},
-            {"v": ["驚く"], "w": ["シオ", "音"]},  # shares "シオ" → same group
+            {"v": ["見る"], "w": ["コウタ", "画面"]},
+            {"v": ["驚く"], "w": ["コウタ", "音"]},  # shares "コウタ" → same group
             {"v": ["食べる"], "w": ["ケーキ"]},  # no shared noun → new group
         ]
         chains = crystallize_buffer(entries, min_verbs=1)
@@ -115,19 +115,19 @@ class TestCrystallizeBuffer:
 
     def test_no_verbs_skipped(self):
         entries = [
-            {"v": [], "w": ["シオ"]},
+            {"v": [], "w": ["コウタ"]},
             {"v": ["見る", "思う"], "w": ["画面"]},
         ]
         chains = crystallize_buffer(entries, min_verbs=2)
         assert len(chains) == 1
 
     def test_source_is_buffer(self):
-        entries = [{"v": ["見る", "思う"], "w": ["シオ"]}]
+        entries = [{"v": ["見る", "思う"], "w": ["コウタ"]}]
         chains = crystallize_buffer(entries, min_verbs=1)
         assert chains[0].source == "buffer"
 
     def test_emotion_and_importance(self):
-        entries = [{"v": ["見る", "思う"], "w": ["シオ"]}]
+        entries = [{"v": ["見る", "思う"], "w": ["コウタ"]}]
         chains = crystallize_buffer(entries, emotion="1", importance=5, min_verbs=1)
         assert chains[0].emotion == "1"
         assert chains[0].importance == 5
@@ -162,7 +162,7 @@ async def verb_chain_store(memory_store):
 class TestVerbChainStore:
     async def test_save_and_search(self, verb_chain_store, sample_chain):
         await verb_chain_store.save(sample_chain)
-        results = await verb_chain_store.search("シオに話しかけた")
+        results = await verb_chain_store.search("コウタに話しかけた")
         assert len(results) >= 1
         found_chain, score = results[0]
         assert found_chain.id == sample_chain.id
@@ -175,7 +175,7 @@ class TestVerbChainStore:
 
     async def test_find_by_noun(self, verb_chain_store, sample_chain):
         await verb_chain_store.save(sample_chain)
-        chains = await verb_chain_store.find_by_noun("シオ")
+        chains = await verb_chain_store.find_by_noun("コウタ")
         assert len(chains) == 1
         assert chains[0].id == sample_chain.id
 
@@ -188,8 +188,8 @@ class TestVerbChainStore:
         chain1 = VerbChain(
             id="c1",
             steps=(
-                VerbStep(verb="見る", nouns=("シオ",)),
-                VerbStep(verb="笑う", nouns=("シオ",)),
+                VerbStep(verb="見る", nouns=("コウタ",)),
+                VerbStep(verb="笑う", nouns=("コウタ",)),
             ),
             timestamp="2026-02-21T12:00:00+00:00",
             emotion="1",
@@ -224,7 +224,7 @@ class TestVerbChainStore:
     async def test_expand_from_noun(self, verb_chain_store):
         chain1 = VerbChain(
             id="c1",
-            steps=(VerbStep(verb="見る", nouns=("シオ",)),),
+            steps=(VerbStep(verb="見る", nouns=("コウタ",)),),
             timestamp="2026-02-21T12:00:00+00:00",
             emotion="8",
             importance=3,
@@ -233,7 +233,7 @@ class TestVerbChainStore:
         )
         await verb_chain_store.save(chain1)
 
-        results, v_verbs, v_nouns = await verb_chain_store.expand_from_fragment(noun="シオ", depth=1)
+        results, v_verbs, v_nouns = await verb_chain_store.expand_from_fragment(noun="コウタ", depth=1)
         assert len(results) == 1
         assert results[0].id == "c1"
 

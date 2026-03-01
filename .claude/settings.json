@@ -5,12 +5,17 @@
         "hooks": [
           {
             "type": "command",
-            "command": "C:/Users/sep61/ClaudeCode/embodied-claude/.claude/hooks/run-interoception.cmd",
+            "command": ".claude/hooks/run-interoception.cmd",
             "timeout": 15
           },
           {
             "type": "command",
-            "command": "C:/Users/sep61/ClaudeCode/embodied-claude/.claude/hooks/run-keyword-buffer.cmd",
+            "command": ".claude/hooks/run-keyword-buffer.cmd",
+            "timeout": 15
+          },
+          {
+            "type": "command",
+            "command": ".claude/hooks/run-recall-lite.cmd",
             "timeout": 15
           }
         ]

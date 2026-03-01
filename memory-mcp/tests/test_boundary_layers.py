@@ -619,8 +619,8 @@ class TestPathDependentLayerSelection:
         chain = VerbChain(
             id="visit-chain",
             steps=(
-                VerbStep(verb="見る", nouns=("シオ",)),
-                VerbStep(verb="笑う", nouns=("シオ",)),
+                VerbStep(verb="見る", nouns=("コウタ",)),
+                VerbStep(verb="笑う", nouns=("コウタ",)),
             ),
             timestamp="2026-01-01T00:00:00+00:00",
             emotion="1", importance=3, source="manual", context="",

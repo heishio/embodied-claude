@@ -138,6 +138,26 @@ class MemoryMCPServer:
                                 "type": "string",
                                 "description": "Transcribed text from audio",
                             },
+                            "steps": {
+                                "type": "array",
+                                "description": "Optional verb chain steps. If provided, also saves an experience (verb chain) alongside the diary entry.",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "verb": {
+                                            "type": "string",
+                                            "description": "The verb (e.g., '見る')",
+                                        },
+                                        "nouns": {
+                                            "type": "array",
+                                            "items": {"type": "string"},
+                                            "description": "Associated nouns",
+                                            "default": [],
+                                        },
+                                    },
+                                    "required": ["verb"],
+                                },
+                            },
                         },
                         "required": ["content"],
                     },
@@ -471,6 +491,13 @@ class MemoryMCPServer:
                                 "type": "integer",
                                 "description": "Graph category ID to assign crystallized chains to (optional)",
                             },
+                            "merge_threshold": {
+                                "type": "number",
+                                "description": "Shared noun ratio threshold for merging entries into same chain (0.0-1.0). Higher = stricter splitting. Default 0.2.",
+                                "default": 0.2,
+                                "minimum": 0.0,
+                                "maximum": 1.0,
+                            },
                         },
                         "required": [],
                     },
@@ -494,7 +521,7 @@ class MemoryMCPServer:
                                         "nouns": {
                                             "type": "array",
                                             "items": {"type": "string"},
-                                            "description": "Associated nouns (e.g., ['シオ', 'キーボード'])",
+                                            "description": "Associated nouns (e.g., ['コウタ', 'キーボード'])",
                                             "default": [],
                                         },
                                     },
@@ -574,9 +601,13 @@ class MemoryMCPServer:
                                 "type": "string",
                                 "description": "A verb to start from (e.g., '見る')",
                             },
+                            "verb2": {
+                                "type": "string",
+                                "description": "A second verb for bigram search (e.g., '驚く'). When used with verb, searches for the verb pair 'verb→verb2' in chain sequences.",
+                            },
                             "noun": {
                                 "type": "string",
-                                "description": "A noun to start from (e.g., 'シオ')",
+                                "description": "A noun to start from (e.g., 'コウタ')",
                             },
                             "depth": {
                                 "type": "integer",
@@ -618,6 +649,36 @@ class MemoryMCPServer:
                                 "default": False,
                             },
                         },
+                    },
+                ),
+                # Update diary
+                Tool(
+                    name="update_diary",
+                    description="Update an existing diary entry with strikethrough + amendment. Original content is preserved with ~~strikethrough~~ and the amendment is appended. Use this to correct or add context to past memories without deleting them.",
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "memory_id": {
+                                "type": "string",
+                                "description": "The ID of the diary entry to update",
+                            },
+                            "amendment": {
+                                "type": "string",
+                                "description": "The amendment text to append",
+                            },
+                            "emotion": {
+                                "type": "string",
+                                "description": "New emotion tag (1-8, optional)",
+                                "enum": ["1", "2", "3", "4", "5", "6", "7", "8"],
+                            },
+                            "importance": {
+                                "type": "integer",
+                                "description": "New importance level (1-5, optional)",
+                                "minimum": 1,
+                                "maximum": 5,
+                            },
+                        },
+                        "required": ["memory_id", "amendment"],
                     },
                 ),
                 # Recall Index
@@ -728,10 +789,37 @@ class MemoryMCPServer:
                         except Exception:
                             pass
 
+                        # Also save verb chain if steps provided
+                        chain_info = ""
+                        steps_raw = arguments.get("steps")
+                        if steps_raw and self._verb_chain_store:
+                            steps = tuple(
+                                VerbStep(
+                                    verb=s["verb"],
+                                    nouns=tuple(s.get("nouns", [])),
+                                )
+                                for s in steps_raw
+                            )
+                            chain = VerbChain(
+                                id=str(uuid.uuid4()),
+                                steps=steps,
+                                timestamp=datetime.now(timezone.utc).isoformat(),
+                                emotion=arguments.get("emotion", "8"),
+                                importance=arguments.get("importance", 3),
+                                source="manual",
+                                context=content,
+                            )
+                            await self._verb_chain_store.save(chain)
+                            try:
+                                await self._memory_store.update_recall_index(chain.id, "chain")
+                            except Exception:
+                                pass
+                            chain_info = f"\nExperience also saved! Chain: {chain.to_document()}\nSteps: {len(chain.steps)}"
+
                         return [
                             TextContent(
                                 type="text",
-                                text=f"Diary entry saved!\nID: {memory.id}\nTimestamp: {memory.timestamp}\nEmotion: {memory.emotion}\nImportance: {memory.importance}\nCategory: {memory.category}{linked_info}",
+                                text=f"Diary entry saved!\nID: {memory.id}\nTimestamp: {memory.timestamp}\nEmotion: {memory.emotion}\nImportance: {memory.importance}\nCategory: {memory.category}{linked_info}{chain_info}",
                             )
                         ]
 
@@ -1014,6 +1102,18 @@ Date Range:
                                 stats.update(graph_stats)
                             except Exception as e:
                                 stats["graph_error"] = str(e)
+
+                        # Core memory compaction → MEMORY.md
+                        try:
+                            from .compaction import compact_core_memories
+                            config = MemoryConfig.from_env()
+                            compaction_stats = compact_core_memories(
+                                db_path=config.db_path,
+                                memory_md_path=config.memory_md_path,
+                            )
+                            stats["compaction"] = compaction_stats
+                        except Exception as e:
+                            stats["compaction_error"] = str(e)
 
                         return [
                             TextContent(
@@ -1547,6 +1647,7 @@ Date Range:
                             emotion=arguments.get("emotion", "8"),
                             importance=arguments.get("importance", 3),
                             min_verbs=arguments.get("min_verbs", 2),
+                            merge_threshold=arguments.get("merge_threshold", 0.2),
                         )
 
                         if not chains:
@@ -1654,6 +1755,16 @@ Date Range:
                             results = [(c, s) for c, s in results if _freshness_filter(c.freshness, fmin, fmax)]
                             results = results[:n_results_exp]
 
+                        # Filter out chains with very short context (< 10 chars)
+                        # Keep them as fallback if not enough rich results
+                        rich = [(c, s) for c, s in results if len(c.context or "") >= 10]
+                        if len(rich) >= n_results_exp:
+                            results = rich[:n_results_exp]
+                        elif rich:
+                            # Fill remaining slots with short-context chains
+                            short = [(c, s) for c, s in results if len(c.context or "") < 10]
+                            results = rich + short[:n_results_exp - len(rich)]
+
                         if not results:
                             return [TextContent(type="text", text="No experiences found.")]
 
@@ -1692,6 +1803,7 @@ Date Range:
 
                     case "recall_by_verb":
                         verb = arguments.get("verb")
+                        verb2 = arguments.get("verb2")
                         noun = arguments.get("noun")
 
                         if not verb and not noun:
@@ -1703,6 +1815,7 @@ Date Range:
                         chains, visited_verbs, visited_nouns = await verb_chain_store.expand_from_fragment(
                             verb=verb,
                             noun=noun,
+                            verb2=verb2,
                             depth=arguments.get("depth", 2),
                             n_results=20,
                             category_id=arguments.get("graph_category"),
@@ -1822,12 +1935,40 @@ Date Range:
 
                         return [TextContent(type="text", text="\n".join(output_lines))]
 
-                    case "rebuild_recall_index":
-                        count = await self._memory_store.build_recall_index()
+                    case "update_diary":
+                        mid = arguments.get("memory_id", "")
+                        amendment = arguments.get("amendment", "")
+                        if not mid or not amendment:
+                            return [TextContent(type="text", text="Error: memory_id and amendment are required")]
+
+                        updated = await self._memory_store.update_diary_content(
+                            memory_id=mid,
+                            amendment=amendment,
+                            emotion=arguments.get("emotion"),
+                            importance=arguments.get("importance"),
+                        )
+                        if updated is None:
+                            return [TextContent(type="text", text=f"Error: memory {mid} not found")]
+
+                        # Update recall index for the updated memory
+                        try:
+                            await self._memory_store.update_recall_index(mid, "memory")
+                        except Exception:
+                            pass
+
                         return [
                             TextContent(
                                 type="text",
-                                text=f"Recall index rebuilt: {count} entries",
+                                text=f"Diary updated!\nID: {updated.id}\nContent:\n{updated.content}\nEmotion: {updated.emotion} | Importance: {updated.importance}",
+                            )
+                        ]
+
+                    case "rebuild_recall_index":
+                        count = await self._memory_store.rebuild_recall_index_full()
+                        return [
+                            TextContent(
+                                type="text",
+                                text=f"Recall index fully rebuilt: {count} entries",
                             )
                         ]
 

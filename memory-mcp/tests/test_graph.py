@@ -22,7 +22,7 @@ async def test_register_chain_creates_vv_edges(graph: MemoryGraph):
     """register_chain creates vv edges for consecutive verbs."""
     await graph.register_chain(
         verbs=["見る", "驚く", "話す"],
-        nouns_per_step=[["空"], ["光"], ["シオ"]],
+        nouns_per_step=[["空"], ["光"], ["コウタ"]],
     )
     neighbors = await graph.query_neighbors("verb", "見る")
     # 見る -> 驚く should exist as vv
@@ -211,7 +211,7 @@ async def test_create_category(graph: MemoryGraph):
 async def test_create_child_category(graph: MemoryGraph):
     """Child categories reference their parent."""
     parent_id = await graph.create_category("会話")
-    child_id = await graph.create_category("シオとの会話", parent_id=parent_id)
+    child_id = await graph.create_category("コウタとの会話", parent_id=parent_id)
     assert child_id != parent_id
 
     cats = await graph.list_categories()
@@ -270,14 +270,14 @@ async def test_recursive_category_includes_children(graph: MemoryGraph):
     """Parent category filter includes nodes from child categories."""
     await graph.register_chain(
         verbs=["見る", "話す"],
-        nouns_per_step=[["空"], ["シオ"]],
+        nouns_per_step=[["空"], ["コウタ"]],
     )
 
     parent_id = await graph.create_category("全体")
     child_id = await graph.create_category("子カテゴリ", parent_id=parent_id)
 
     # Assign nodes to the child category
-    await graph.assign_chain_nodes_to_category(["見る", "話す"], [["空"], ["シオ"]], child_id)
+    await graph.assign_chain_nodes_to_category(["見る", "話す"], [["空"], ["コウタ"]], child_id)
 
     # Query with parent category should include child's nodes
     parent_node_ids = await graph.get_category_node_ids(parent_id)

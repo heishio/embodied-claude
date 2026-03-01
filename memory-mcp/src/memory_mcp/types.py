@@ -254,7 +254,7 @@ class VerbStep:
     """動詞チェーンの1ステップ."""
 
     verb: str  # "見る"
-    nouns: tuple[str, ...]  # ("シオ", "キーボード")
+    nouns: tuple[str, ...]  # ("コウタ", "キーボード")
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
@@ -266,7 +266,7 @@ class VerbStep:
         return cls(verb=data["verb"], nouns=tuple(data.get("nouns", ())))
 
     def to_text(self) -> str:
-        """テキスト表現: 見る(シオ, キーボード)."""
+        """テキスト表現: 見る(コウタ, キーボード)."""
         if self.nouns:
             return f"{self.verb}({', '.join(self.nouns)})"
         return self.verb
@@ -292,6 +292,10 @@ class VerbChain:
         if self.context:
             doc = f"{doc} [{self.context}]"
         return doc
+
+    def to_flow_document(self) -> str:
+        """動詞だけのフローテキスト（フローエンベディング用）."""
+        return " ".join(step.verb for step in self.steps)
 
     def to_metadata(self) -> dict[str, Any]:
         """ストレージ用メタデータ."""
