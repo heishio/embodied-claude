@@ -1979,6 +1979,11 @@ class MemoryStore:
         result = stats.to_dict()
 
         if synthesize:
+            # Clean up stale composite_axes from previous model migrations
+            if self._chive is not None:
+                expected_dim = self._chive.vector_size * 2  # flow + delta
+                await self.cleanup_stale_composite_axes(expected_dim)
+
             # Level 0 → 1
             synth_stats = await self._consolidation_engine.synthesize_composites(
                 store=self,
@@ -2321,6 +2326,40 @@ class MemoryStore:
             return result
 
         return await asyncio.to_thread(_fetch)
+
+    async def cleanup_stale_composite_axes(self, expected_dim: int) -> int:
+        """Delete composite_axes with mismatched dimensions (e.g. after model migration).
+
+        Returns number of stale composites removed.
+        """
+        db = self._ensure_connected()
+
+        def _cleanup() -> int:
+            rows = db.execute(
+                "SELECT composite_id, axis_vector FROM composite_axes"
+            ).fetchall()
+            stale_ids = []
+            for row in rows:
+                vec = decode_vector(bytes(row["axis_vector"]))
+                if len(vec) != expected_dim:
+                    stale_ids.append(row["composite_id"])
+            if stale_ids:
+                for cid in stale_ids:
+                    db.execute("DELETE FROM composite_axes WHERE composite_id=?", (cid,))
+                    db.execute("DELETE FROM composite_members WHERE composite_id=?", (cid,))
+                    db.execute(
+                        "DELETE FROM composite_intersections "
+                        "WHERE composite_a=? OR composite_b=?",
+                        (cid, cid),
+                    )
+                db.commit()
+                logger.warning(
+                    "Cleaned up %d stale composite_axes (expected %d-dim)",
+                    len(stale_ids), expected_dim,
+                )
+            return len(stale_ids)
+
+        return await asyncio.to_thread(_cleanup)
 
     async def fetch_all_composite_member_sets(self) -> dict[str, set[str]]:
         """全compositeのメンバーIDセットを {composite_id: set(member_ids)} で返す。"""

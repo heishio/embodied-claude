@@ -1,70 +1,18 @@
 #!/usr/bin/env python
-"""recall-lite.py - 軽い記憶検索フック。名詞2つ+動詞1つでメモリDBに問い合わせ、ヒントを返す。
+"""recall-lite.py - 軽い記憶検索フック。全名詞+動詞2つでメモリDBに問い合わせ、
+スコアをアグリゲートして文脈に近い記憶を返す。
 
 recall_index テーブル（ベクトル類似度の事前計算インデックス）があればそれを使い、
 なければ従来の LIKE 検索にフォールバックする。
 """
 import json
 import os
+import re
 import sqlite3
 import sys
 
 
-def _noun_like_fallback(conn, noun, hints):
-    """従来の LIKE 検索による名詞検索。"""
-    row = conn.execute(
-        "SELECT COUNT(*) FROM memories WHERE content LIKE ?",
-        (f"%{noun}%",),
-    ).fetchone()
-    mem_count = row[0] if row else 0
-
-    row = conn.execute(
-        "SELECT COUNT(*) FROM verb_chains WHERE all_nouns LIKE ?",
-        (f"%{noun}%",),
-    ).fetchone()
-    exp_count = row[0] if row else 0
-
-    if mem_count > 0 or exp_count > 0:
-        rows = conn.execute(
-            "SELECT content FROM memories WHERE content LIKE ? ORDER BY timestamp DESC LIMIT 4",
-            (f"%{noun}%",),
-        ).fetchall()
-        samples = [r[0][:20] for r in rows if r[0]]
-        sample_str = " / ".join(samples) if samples else ""
-        if sample_str:
-            hints.append(f"noun={noun} ({mem_count}件, 例: {sample_str})")
-        else:
-            hints.append(f"noun={noun} ({mem_count}件)")
-
-
-def _verb_like_fallback(conn, verb, hints):
-    """従来の LIKE 検索による動詞検索。"""
-    row = conn.execute(
-        "SELECT COUNT(*) FROM verb_chains WHERE all_verbs LIKE ?",
-        (f"%{verb}%",),
-    ).fetchone()
-    verb_exp_count = row[0] if row else 0
-
-    if verb_exp_count > 0:
-        rows = conn.execute(
-            "SELECT context, all_nouns FROM verb_chains WHERE all_verbs LIKE ? ORDER BY timestamp DESC LIMIT 4",
-            (f"%{verb}%",),
-        ).fetchall()
-        samples = []
-        for r in rows:
-            ctx, nouns = r[0], r[1]
-            if ctx:
-                samples.append(ctx[:20])
-            elif nouns:
-                samples.append(nouns[:20])
-        sample_str = " / ".join(samples) if samples else ""
-        if sample_str:
-            hints.append(f"verb={verb} ({verb_exp_count}件, 例: {sample_str})")
-        else:
-            hints.append(f"verb={verb} ({verb_exp_count}件)")
-
-
-# ── メイン処理 ──
+# ── 入力 ──
 
 text = ""
 try:
@@ -85,6 +33,9 @@ if "自律行動タイム" in text:
 # サロゲート文字を除去
 text = text.encode("utf-8", errors="ignore").decode("utf-8")
 
+# <system-reminder>タグを除去
+text = re.sub(r"<system-reminder>.*?</system-reminder>", "", text, flags=re.DOTALL)
+
 try:
     from sudachipy import Dictionary
 
@@ -97,11 +48,11 @@ try:
 except Exception:
     sys.exit(0)
 
-# 汎用的すぎる動詞（ノイズになる）
-VERB_STOPLIST = {"為る", "有る", "居る", "成る", "出来る"}
+# ── 単語抽出 ──
 
-# 全トークンから名詞・動詞の候補を集める
+VERB_STOPLIST = {"為る", "有る", "居る", "成る", "出来る"}
 NOUN_STOPLIST = {"こと", "もの", "ため", "よう", "ところ", "はず", "わけ", "つもり", "ほう"}
+
 all_nouns = []
 all_verbs = []
 for t in tokens:
@@ -115,23 +66,19 @@ for t in tokens:
         if lemma not in VERB_STOPLIST:
             all_verbs.append(lemma)
 
-# 名詞: 先頭1つ + 末尾1つ（重複排除）
-if len(all_nouns) >= 2:
-    nouns = [all_nouns[0]]
-    if all_nouns[-1] != all_nouns[0]:
-        nouns.append(all_nouns[-1])
-elif all_nouns:
-    nouns = all_nouns[:1]
-else:
-    nouns = []
+# 名詞: 全部（重複排除、順序保持）
+nouns = list(dict.fromkeys(all_nouns))
+# 動詞: 末尾2つ（重複排除）
+unique_verbs = list(dict.fromkeys(all_verbs))
+verbs = unique_verbs[-2:] if len(unique_verbs) >= 2 else unique_verbs
 
-# 動詞: 末尾1つ（後半優先）
-verb = all_verbs[-1] if all_verbs else None
+query_words = [(w, "noun") for w in nouns] + [(w, "verb") for w in verbs]
 
-if not nouns and not verb:
+if not query_words:
     sys.exit(0)
 
-# メモリDBに直接アクセス
+# ── DB接続 ──
+
 db_path = os.path.join(os.path.expanduser("~"), ".claude", "memories", "memory.db")
 if not os.path.exists(db_path):
     sys.exit(0)
@@ -141,7 +88,6 @@ try:
 except Exception:
     sys.exit(0)
 
-# recall_index テーブルの存在チェック
 has_recall_index = False
 try:
     conn.execute("SELECT 1 FROM recall_index LIMIT 1")
@@ -149,67 +95,97 @@ try:
 except Exception:
     pass
 
-hints = []
+PREVIEW_LEN = 30
+MAX_RESULTS = 8
 
-PREVIEW_LEN = 20
+
+def _like_fallback(conn, nouns, verbs):
+    """recall_index が使えない場合の LIKE フォールバック。"""
+    hints = []
+    for noun in nouns[:2]:
+        row = conn.execute(
+            "SELECT COUNT(*) FROM memories WHERE content LIKE ?",
+            (f"%{noun}%",),
+        ).fetchone()
+        cnt = row[0] if row else 0
+        if cnt > 0:
+            rows = conn.execute(
+                "SELECT content FROM memories WHERE content LIKE ? ORDER BY timestamp DESC LIMIT 3",
+                (f"%{noun}%",),
+            ).fetchall()
+            samples = [r[0][:PREVIEW_LEN] for r in rows if r[0]]
+            sample_str = " / ".join(samples)
+            if sample_str:
+                hints.append(f"noun={noun} ({cnt}件, 例: {sample_str})")
+            else:
+                hints.append(f"noun={noun} ({cnt}件)")
+    for verb in verbs:
+        row = conn.execute(
+            "SELECT COUNT(*) FROM verb_chains WHERE all_verbs LIKE ?",
+            (f"%{verb}%",),
+        ).fetchone()
+        cnt = row[0] if row else 0
+        if cnt > 0:
+            hints.append(f"verb={verb} ({cnt}件)")
+    if hints:
+        print(f"[memory-hint] {', '.join(hints)}")
+
 
 try:
-    for noun in nouns:
-        if has_recall_index:
-            # ベクトルインデックス検索
+    if has_recall_index:
+        # ── アグリゲート方式 ──
+        # 全単語について recall_index を引き、(target_type, target_id) でスコア合算
+        scores = {}       # (type, id) → total_similarity
+        previews = {}     # (type, id) → content_preview
+        hit_words = {}    # (type, id) → set of words that matched
+
+        for word, wtype in query_words:
             rows = conn.execute(
                 "SELECT target_type, target_id, similarity, content_preview "
                 "FROM recall_index WHERE word = ? "
-                "ORDER BY similarity DESC LIMIT 8",
-                (noun,),
+                "ORDER BY similarity DESC LIMIT 10",
+                (word,),
             ).fetchall()
 
-            if rows:
-                mem_count = sum(1 for r in rows if r[0] == "memory")
-                chain_count = sum(1 for r in rows if r[0] == "chain")
-                samples = [r[3][:PREVIEW_LEN] for r in rows[:3] if r[3]]
-                total = mem_count + chain_count
-                sample_str = " / ".join(samples) if samples else ""
-                if sample_str:
-                    hints.append(f"noun={noun} ({total}件, 例: {sample_str})")
-                else:
-                    hints.append(f"noun={noun} ({total}件)")
-            else:
-                # recall_index にワードがない → LIKE フォールバック
-                _noun_like_fallback(conn, noun, hints)
-        else:
-            # recall_index テーブルなし → LIKE フォールバック
-            _noun_like_fallback(conn, noun, hints)
+            for target_type, target_id, similarity, preview in rows:
+                key = (target_type, target_id)
+                scores[key] = scores.get(key, 0.0) + similarity
+                if key not in previews and preview:
+                    previews[key] = preview
+                if key not in hit_words:
+                    hit_words[key] = set()
+                hit_words[key].add(word)
 
-    if verb:
-        if has_recall_index:
-            # ベクトルインデックス検索
-            rows = conn.execute(
-                "SELECT target_type, target_id, similarity, content_preview "
-                "FROM recall_index WHERE word = ? "
-                "ORDER BY similarity DESC LIMIT 8",
-                (verb,),
-            ).fetchall()
+        if scores:
+            # 複数単語がヒットした記憶にボーナス
+            for key in scores:
+                n_hits = len(hit_words[key])
+                if n_hits > 1:
+                    scores[key] *= (1.0 + 0.2 * (n_hits - 1))
 
-            if rows:
-                mem_count = sum(1 for r in rows if r[0] == "memory")
-                chain_count = sum(1 for r in rows if r[0] == "chain")
-                samples = [r[3][:PREVIEW_LEN] for r in rows[:3] if r[3]]
-                total = mem_count + chain_count
-                sample_str = " / ".join(samples) if samples else ""
-                if sample_str:
-                    hints.append(f"verb={verb} ({total}件, 例: {sample_str})")
-                else:
-                    hints.append(f"verb={verb} ({total}件)")
+            ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)[:MAX_RESULTS]
+            total = len(scores)
+            samples = []
+            for key, score in ranked[:4]:
+                p = previews.get(key, "")
+                if p:
+                    samples.append(p[:PREVIEW_LEN])
+
+            sample_str = " / ".join(samples)
+            words_str = ",".join(w for w, _ in query_words)
+            if sample_str:
+                print(f"[memory-hint] [{words_str}] ({total}件, 例: {sample_str})")
             else:
-                _verb_like_fallback(conn, verb, hints)
+                print(f"[memory-hint] [{words_str}] ({total}件)")
         else:
-            _verb_like_fallback(conn, verb, hints)
+            # recall_index にヒットなし → LIKE フォールバック
+            _like_fallback(conn, nouns, verbs)
+
+    else:
+        # recall_index なし → LIKE フォールバック
+        _like_fallback(conn, nouns, verbs)
 
 except Exception:
     pass
 finally:
     conn.close()
-
-if hints:
-    print(f"[memory-hint] {', '.join(hints)}")

@@ -38,7 +38,7 @@ DBファイル: `~/.claude/memories/memory.db`
 
 ## エンベディング（2ベクトルアーキテクチャ）
 
-- **モデル**: chiVe（日本語word2vec, 300次元）
+- **モデル**: [chiVe](https://github.com/WorksApplications/chiVe)（日本語word2vec, 300次元）
 - **2ベクトル構造**: 各記憶は2つのベクトルを持つ
   - `flow_vector`（300次元）: 動詞バイグラム中点の平均。「何をしたか」
   - `delta_vector`（300次元）: 名詞平均 − 動詞平均。「何に対してか」

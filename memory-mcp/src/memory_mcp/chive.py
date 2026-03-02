@@ -17,6 +17,14 @@ _sudachi_tokenizer = None
 _VERB_STOPLIST = {"為る", "有る", "居る", "成る", "出来る"}
 _NOUN_STOPLIST = {"こと", "もの", "ため", "よう", "それ", "これ", "ここ", "そこ"}
 
+# 汎用動詞: flow計算でバイグラムの前側としてスキップ
+# 日本語の補助動詞的用法（食べてみる、やってくれる等）では
+# 前の動詞に吸収されるが、次の動詞への橋渡しはしない
+_GENERIC_VERBS = {
+    "為る", "有る", "居る", "成る", "出来る",  # _VERB_STOPLISTと共通
+    "言う", "呉れる", "遣る", "来る", "見る", "行く", "貰う", "置く",
+}
+
 
 def _get_sudachi_tokenizer():
     global _sudachi_tokenizer
@@ -130,23 +138,43 @@ class ChiVeEmbedding:
         """Compute flow vector from verb list.
 
         - Collects chiVe vectors for each verb
-        - Computes bigram midpoints (or single verb vector)
+        - Skips bigrams where a generic verb is the left element
+          (generic verbs absorb into preceding verb but don't bridge forward)
+        - Adds bookend midpoint (first + last verb) weighted by bigram count
         - L2-normalizes the result
         - Returns zero vector if all verbs are OOV
         """
         vecs = []
+        is_generic = []
         for v in verbs:
             vec = self.get_word_vector(v)
             if vec is not None:
                 vecs.append(vec)
+                is_generic.append(_normalize_word(v) in _GENERIC_VERBS)
 
         if not vecs:
             return np.zeros(self.vector_size, dtype=np.float32)
 
         vecs_arr = np.array(vecs)
         if len(vecs_arr) >= 2:
-            bigrams = [(vecs_arr[i] + vecs_arr[i + 1]) / 2.0 for i in range(len(vecs_arr) - 1)]
-            flow_vec = np.mean(bigrams, axis=0)
+            # Skip bigrams where generic verb is the left element
+            bigrams = []
+            for i in range(len(vecs_arr) - 1):
+                if is_generic[i]:
+                    continue
+                bigrams.append((vecs_arr[i] + vecs_arr[i + 1]) / 2.0)
+
+            # Fallback: all left-side verbs were generic
+            if not bigrams:
+                bigrams = [
+                    (vecs_arr[i] + vecs_arr[i + 1]) / 2.0
+                    for i in range(len(vecs_arr) - 1)
+                ]
+
+            # Bookend: first+last midpoint, repeated len(bigrams) times
+            bookend = (vecs_arr[0] + vecs_arr[-1]) / 2.0
+            all_midpoints = bigrams + [bookend] * len(bigrams)
+            flow_vec = np.mean(all_midpoints, axis=0)
         else:
             flow_vec = vecs_arr[0].copy()
 
