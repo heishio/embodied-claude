@@ -32,6 +32,28 @@ logger = logging.getLogger(__name__)
 _PRIVATE_KEY = "quo-inner-voice"
 
 
+# Quadrant → flow_weight mapping (Gentner's 4-quadrant analogy)
+QUADRANT_WEIGHTS: dict[str, float] = {
+    "literal": 0.5,   # flow高 + delta高: 同じことを同じ対象に
+    "analogy": 0.9,   # flow高 + delta低: 同じことを違う対象に（構造的類似）
+    "surface": 0.1,   # flow低 + delta高: 違うことを同じ対象に（表面的類似）
+    "anomaly": 0.5,   # flow低 + delta低: 広く拾う（閾値で調整）
+}
+
+QUADRANT_SCHEMA = {
+    "type": "string",
+    "description": "Search quadrant: 'literal' (same action, same target), 'analogy' (same action, different target), 'surface' (different action, same target). Changes how flow/delta axes are weighted.",
+    "enum": ["literal", "analogy", "surface"],
+}
+
+
+def _quadrant_to_flow_weight(quadrant: str | None) -> float:
+    """Convert quadrant name to flow_weight value."""
+    if quadrant is None:
+        return 0.6  # default balanced
+    return QUADRANT_WEIGHTS.get(quadrant, 0.6)
+
+
 def _freshness_filter(freshness: float, fmin: float | None, fmax: float | None) -> bool:
     """freshness が範囲内かチェック。None は制限なし。"""
     if fmin is not None and freshness < fmin:
@@ -162,22 +184,30 @@ class MemoryMCPServer:
                         "required": ["content"],
                     },
                 ),
+                # search_memories: removed (merged into recall)
                 Tool(
-                    name="search_memories",
-                    description="Search through memories using semantic similarity. Find memories related to a topic or query.",
+                    name="recall",
+                    description="Automatically recall relevant memories based on the current conversation context. Use this to remember things that might be relevant. Set chain_depth >= 1 to also include linked/associated memories.",
                     inputSchema={
                         "type": "object",
                         "properties": {
-                            "query": {
+                            "context": {
                                 "type": "string",
-                                "description": "Search query to find related memories",
+                                "description": "Current conversation context or topic",
                             },
                             "n_results": {
                                 "type": "integer",
-                                "description": "Maximum number of results to return",
-                                "default": 5,
+                                "description": "Number of memories to recall",
+                                "default": 3,
                                 "minimum": 1,
-                                "maximum": 20,
+                                "maximum": 10,
+                            },
+                            "chain_depth": {
+                                "type": "integer",
+                                "description": "How many levels of linked memories to follow (0=none, 1-3=with associations)",
+                                "default": 0,
+                                "minimum": 0,
+                                "maximum": 3,
                             },
                             "emotion_filter": {
                                 "type": "string",
@@ -209,46 +239,7 @@ class MemoryMCPServer:
                                 "minimum": 0.0,
                                 "maximum": 1.0,
                             },
-                        },
-                        "required": ["query"],
-                    },
-                ),
-                Tool(
-                    name="recall",
-                    description="Automatically recall relevant memories based on the current conversation context. Use this to remember things that might be relevant. Set chain_depth >= 1 to also include linked/associated memories.",
-                    inputSchema={
-                        "type": "object",
-                        "properties": {
-                            "context": {
-                                "type": "string",
-                                "description": "Current conversation context or topic",
-                            },
-                            "n_results": {
-                                "type": "integer",
-                                "description": "Number of memories to recall",
-                                "default": 3,
-                                "minimum": 1,
-                                "maximum": 10,
-                            },
-                            "chain_depth": {
-                                "type": "integer",
-                                "description": "How many levels of linked memories to follow (0=none, 1-3=with associations)",
-                                "default": 0,
-                                "minimum": 0,
-                                "maximum": 3,
-                            },
-                            "freshness_min": {
-                                "type": "number",
-                                "description": "Minimum freshness (0.0-1.0). Higher = more recent.",
-                                "minimum": 0.0,
-                                "maximum": 1.0,
-                            },
-                            "freshness_max": {
-                                "type": "number",
-                                "description": "Maximum freshness (0.0-1.0). Lower = more distant.",
-                                "minimum": 0.0,
-                                "maximum": 1.0,
-                            },
+                            "quadrant": QUADRANT_SCHEMA,
                         },
                         "required": ["context"],
                     },
@@ -502,58 +493,7 @@ class MemoryMCPServer:
                         "required": [],
                     },
                 ),
-                Tool(
-                    name="remember_experience",
-                    description="Manually create a verb chain (experience). Use this to structure an experience as a sequence of verbs with associated nouns.",
-                    inputSchema={
-                        "type": "object",
-                        "properties": {
-                            "steps": {
-                                "type": "array",
-                                "description": "Sequence of verb steps",
-                                "items": {
-                                    "type": "object",
-                                    "properties": {
-                                        "verb": {
-                                            "type": "string",
-                                            "description": "The verb (e.g., '見る')",
-                                        },
-                                        "nouns": {
-                                            "type": "array",
-                                            "items": {"type": "string"},
-                                            "description": "Associated nouns (e.g., ['コウタ', 'キーボード'])",
-                                            "default": [],
-                                        },
-                                    },
-                                    "required": ["verb"],
-                                },
-                            },
-                            "context": {
-                                "type": "string",
-                                "description": "Free-form context/description for this experience",
-                                "default": "",
-                            },
-                            "emotion": {
-                                "type": "string",
-                                "description": "Emotion tag (1-8)",
-                                "default": "8",
-                                "enum": ["1", "2", "3", "4", "5", "6", "7", "8"],
-                            },
-                            "importance": {
-                                "type": "integer",
-                                "description": "Importance (1-5)",
-                                "default": 3,
-                                "minimum": 1,
-                                "maximum": 5,
-                            },
-                            "graph_category": {
-                                "type": "integer",
-                                "description": "Graph category ID to assign this experience to (optional)",
-                            },
-                        },
-                        "required": ["steps"],
-                    },
-                ),
+                # remember_experience: removed (use diary with steps parameter)
                 Tool(
                     name="recall_experience",
                     description="Recall verb chains (experiences) by semantic similarity. Uses time decay, emotion boost, and importance scoring.",
@@ -587,70 +527,13 @@ class MemoryMCPServer:
                                 "minimum": 0.0,
                                 "maximum": 1.0,
                             },
+                            "quadrant": QUADRANT_SCHEMA,
                         },
                         "required": ["context"],
                     },
                 ),
-                Tool(
-                    name="recall_by_verb",
-                    description="Recall experiences starting from a specific verb or noun. Expands associatively through shared verbs/nouns across chains.",
-                    inputSchema={
-                        "type": "object",
-                        "properties": {
-                            "verb": {
-                                "type": "string",
-                                "description": "A verb to start from (e.g., '見る')",
-                            },
-                            "verb2": {
-                                "type": "string",
-                                "description": "A second verb for bigram search (e.g., '驚く'). When used with verb, searches for the verb pair 'verb→verb2' in chain sequences.",
-                            },
-                            "noun": {
-                                "type": "string",
-                                "description": "A noun to start from (e.g., 'コウタ')",
-                            },
-                            "depth": {
-                                "type": "integer",
-                                "description": "How many expansion levels (1-5)",
-                                "default": 2,
-                                "minimum": 1,
-                                "maximum": 5,
-                            },
-                            "graph_category": {
-                                "type": "integer",
-                                "description": "Filter by graph category ID (includes subcategories)",
-                            },
-                            "freshness_min": {
-                                "type": "number",
-                                "description": "Minimum freshness (0.0-1.0). Higher = more recent.",
-                                "minimum": 0.0,
-                                "maximum": 1.0,
-                            },
-                            "freshness_max": {
-                                "type": "number",
-                                "description": "Maximum freshness (0.0-1.0). Lower = more distant.",
-                                "minimum": 0.0,
-                                "maximum": 1.0,
-                            },
-                        },
-                        "required": [],
-                    },
-                ),
-                # Sensory Buffer / Dream
-                Tool(
-                    name="dream",
-                    description="Review the sensory buffer (rough keyword log from conversations). Use this to 'dream' - find patterns in accumulated keywords, then promote important ones to diary entries or experiences.",
-                    inputSchema={
-                        "type": "object",
-                        "properties": {
-                            "clear": {
-                                "type": "boolean",
-                                "description": "Clear the buffer after reading (default: false)",
-                                "default": False,
-                            },
-                        },
-                    },
-                ),
+                # recall_by_verb: removed (graph expansion used internally, quadrant covers recall use cases)
+                # dream: removed (buffer check covered by crystallize)
                 # Update diary
                 Tool(
                     name="update_diary",
@@ -823,45 +706,7 @@ class MemoryMCPServer:
                             )
                         ]
 
-                    case "search_memories":
-                        query = arguments.get("query", "")
-                        if not query:
-                            return [TextContent(type="text", text="Error: query is required")]
-
-                        fmin = arguments.get("freshness_min")
-                        fmax = arguments.get("freshness_max")
-                        results = await self._memory_store.search(
-                            query=query,
-                            n_results=arguments.get("n_results", 5) * (3 if fmin or fmax else 1),
-                            emotion_filter=arguments.get("emotion_filter"),
-                            category_filter=arguments.get("category_filter"),
-                            date_from=arguments.get("date_from"),
-                            date_to=arguments.get("date_to"),
-                        )
-                        if fmin is not None or fmax is not None:
-                            results = [r for r in results if _freshness_filter(r.memory.freshness, fmin, fmax)]
-                            results = results[:arguments.get("n_results", 5)]
-
-                        if not results:
-                            return [TextContent(type="text", text="No memories found matching the query.")]
-
-                        output_lines = [f"Found {len(results)} memories:\n"]
-                        for i, result in enumerate(results, 1):
-                            m = result.memory
-                            image_line = ""
-                            for sd in m.sensory_data:
-                                if sd.sensory_type == "visual" and sd.image_data:
-                                    image_line = f"Image: data:image/jpeg;base64,{sd.image_data}\n"
-                                    break
-                            output_lines.append(
-                                f"--- Memory {i} (distance: {result.distance:.4f}) ---\n"
-                                f"ID: {m.id}\n"
-                                f"[{m.freshness:.2f}] [{m.emotion}] [{m.category}] (importance: {m.importance})\n"
-                                f"{m.content}\n"
-                                f"{image_line}"
-                            )
-
-                        return [TextContent(type="text", text="\n".join(output_lines))]
+                    # search_memories: removed (merged into recall)
 
                     case "recall":
                         context = arguments.get("context", "")
@@ -872,6 +717,11 @@ class MemoryMCPServer:
                         n_results = arguments.get("n_results", 3)
                         fmin = arguments.get("freshness_min")
                         fmax = arguments.get("freshness_max")
+                        fw = _quadrant_to_flow_weight(arguments.get("quadrant"))
+                        emotion_filter = arguments.get("emotion_filter")
+                        category_filter = arguments.get("category_filter")
+                        date_from = arguments.get("date_from")
+                        date_to = arguments.get("date_to")
 
                         if chain_depth >= 1:
                             # With associations (merged recall_with_associations)
@@ -879,6 +729,11 @@ class MemoryMCPServer:
                                 context=context,
                                 n_results=n_results * (3 if fmin or fmax else 1),
                                 chain_depth=chain_depth,
+                                flow_weight=fw,
+                                emotion_filter=emotion_filter,
+                                category_filter=category_filter,
+                                date_from=date_from,
+                                date_to=date_to,
                             )
                             if fmin is not None or fmax is not None:
                                 results = [r for r in results if _freshness_filter(r.memory.freshness, fmin, fmax)]
@@ -919,6 +774,11 @@ class MemoryMCPServer:
                         results = await self._memory_store.recall(
                             context=context,
                             n_results=n_results * (3 if fmin or fmax else 1),
+                            flow_weight=fw,
+                            emotion_filter=emotion_filter,
+                            category_filter=category_filter,
+                            date_from=date_from,
+                            date_to=date_to,
                         )
                         if fmin is not None or fmax is not None:
                             results = [r for r in results if _freshness_filter(r.memory.freshness, fmin, fmax)]
@@ -1693,49 +1553,7 @@ Date Range:
 
                         return [TextContent(type="text", text="\n".join(output_lines))]
 
-                    case "remember_experience":
-                        steps_raw = arguments.get("steps", [])
-                        if not steps_raw:
-                            return [TextContent(type="text", text="Error: steps is required")]
-
-                        steps = tuple(
-                            VerbStep(
-                                verb=s["verb"],
-                                nouns=tuple(s.get("nouns", [])),
-                            )
-                            for s in steps_raw
-                        )
-
-                        chain = VerbChain(
-                            id=str(uuid.uuid4()),
-                            steps=steps,
-                            timestamp=datetime.now(timezone.utc).isoformat(),
-                            emotion=arguments.get("emotion", "8"),
-                            importance=arguments.get("importance", 3),
-                            source="manual",
-                            context=arguments.get("context", ""),
-                        )
-
-                        verb_chain_store = self._verb_chain_store
-                        graph_category = arguments.get("graph_category")
-                        await verb_chain_store.save(chain, category_id=graph_category)
-
-                        # Update recall index for new chain
-                        try:
-                            await self._memory_store.update_recall_index(chain.id, "chain")
-                        except Exception:
-                            pass
-
-                        cat_info = f" | Category: {graph_category}" if graph_category else ""
-                        return [
-                            TextContent(
-                                type="text",
-                                text=f"Experience saved!\n"
-                                     f"ID: {chain.id}\n"
-                                     f"Chain: {chain.to_document()}\n"
-                                     f"Steps: {len(chain.steps)} | Emotion: {chain.emotion} | Importance: {chain.importance}{cat_info}",
-                            )
-                        ]
+                    # remember_experience: removed (use diary with steps)
 
                     case "recall_experience":
                         context = arguments.get("context", "")
@@ -1744,12 +1562,14 @@ Date Range:
 
                         fmin = arguments.get("freshness_min")
                         fmax = arguments.get("freshness_max")
+                        fw = _quadrant_to_flow_weight(arguments.get("quadrant"))
                         n_results_exp = arguments.get("n_results", 5)
                         verb_chain_store = self._verb_chain_store
                         results = await verb_chain_store.search(
                             query=context,
                             n_results=n_results_exp * (3 if fmin or fmax else 1),
                             category_id=arguments.get("graph_category"),
+                            flow_weight=fw,
                         )
                         if fmin is not None or fmax is not None:
                             results = [(c, s) for c, s in results if _freshness_filter(c.freshness, fmin, fmax)]
@@ -1801,139 +1621,9 @@ Date Range:
 
                         return [TextContent(type="text", text="\n".join(output_lines))]
 
-                    case "recall_by_verb":
-                        verb = arguments.get("verb")
-                        verb2 = arguments.get("verb2")
-                        noun = arguments.get("noun")
+                    # recall_by_verb: removed (graph expansion used internally)
 
-                        if not verb and not noun:
-                            return [TextContent(type="text", text="Error: verb or noun is required")]
-
-                        fmin = arguments.get("freshness_min")
-                        fmax = arguments.get("freshness_max")
-                        verb_chain_store = self._verb_chain_store
-                        chains, visited_verbs, visited_nouns = await verb_chain_store.expand_from_fragment(
-                            verb=verb,
-                            noun=noun,
-                            verb2=verb2,
-                            depth=arguments.get("depth", 2),
-                            n_results=20,
-                            category_id=arguments.get("graph_category"),
-                        )
-
-                        if fmin is not None or fmax is not None:
-                            chains = [c for c in chains if _freshness_filter(c.freshness, fmin, fmax)]
-
-                        # Path-dependent boundary rerank
-                        try:
-                            if visited_verbs or visited_nouns:
-                                path_text = " ".join(visited_verbs + visited_nouns)
-                                path_flow, _ = await self._memory_store._encode_text(
-                                    normalize_japanese(path_text)
-                                )
-                                path_vec = path_flow
-                                layer_idx = await self._memory_store.select_active_boundary_layer(path_vec)
-                            else:
-                                layer_idx = None
-
-                            chain_ids = [c.id for c in chains]
-                            boundary_scores = await self._memory_store.get_chain_boundary_scores(
-                                chain_ids, layer_index=layer_idx,
-                            )
-
-                            # Rerank: original position score + boundary bonus
-                            scored_with_pos = [
-                                (chain, 1.0 / (i + 1) + 0.1 * boundary_scores.get(chain.id, 0.0))
-                                for i, chain in enumerate(chains)
-                            ]
-                            scored_with_pos.sort(key=lambda x: x[1], reverse=True)
-                            chains = [c for c, _ in scored_with_pos]
-                        except Exception:
-                            pass  # boundary データがなくても既存動作を維持
-
-                        # Bump graph edges for recalled chains
-                        for chain in chains:
-                            try:
-                                await verb_chain_store.bump_chain_edges(chain)
-                            except Exception:
-                                pass
-
-                        if not chains:
-                            query_desc = f"verb={verb}" if verb else ""
-                            if noun:
-                                query_desc += f"{' ' if query_desc else ''}noun={noun}"
-                            return [TextContent(type="text", text=f"No experiences found for {query_desc}.")]
-
-                        output_lines = [f"Found {len(chains)} related experiences:\n"]
-                        for i, chain in enumerate(chains, 1):
-                            output_lines.append(
-                                f"--- Experience {i} ---\n"
-                                f"ID: {chain.id}\n"
-                                f"[{chain.freshness:.2f}] [{chain.emotion}] (importance: {chain.importance})\n"
-                                f"Chain: {chain.to_document()}\n"
-                            )
-
-                        return [TextContent(type="text", text="\n".join(output_lines))]
-
-                    # Sensory Buffer / Dream
-                    case "dream":
-                        buf_path = os.path.join(os.path.expanduser("~"), ".claude", "sensory_buffer.jsonl")
-                        if not os.path.exists(buf_path):
-                            return [TextContent(type="text", text="バッファは空です。まだ夢の材料がありません。")]
-
-                        words_count: dict[str, int] = {}
-                        verbs_count: dict[str, int] = {}
-                        verb_chains: list[list[str]] = []
-                        line_count = 0
-                        with open(buf_path, "r", encoding="utf-8") as f:
-                            for line in f:
-                                line = line.strip()
-                                if not line:
-                                    continue
-                                try:
-                                    entry = json.loads(line)
-                                    for w in entry.get("w", []):
-                                        words_count[w] = words_count.get(w, 0) + 1
-                                    v_list = entry.get("v", [])
-                                    for v in v_list:
-                                        verbs_count[v] = verbs_count.get(v, 0) + 1
-                                    if v_list:
-                                        verb_chains.append(v_list)
-                                    line_count += 1
-                                except json.JSONDecodeError:
-                                    continue
-
-                        if not words_count and not verbs_count:
-                            return [TextContent(type="text", text="バッファは空です。")]
-
-                        output_lines = [f"## 夢の材料 ({line_count} interactions)\n"]
-
-                        if words_count:
-                            sorted_words = sorted(words_count.items(), key=lambda x: x[1], reverse=True)
-                            output_lines.append("### よく出てくるワード（名詞）")
-                            for word, count in sorted_words[:20]:
-                                output_lines.append(f"- {word}: {count}回")
-                            if len(sorted_words) > 20:
-                                output_lines.append(f"\n### その他 ({len(sorted_words) - 20}語)")
-                                others = [w for w, _ in sorted_words[20:]]
-                                output_lines.append(", ".join(others))
-
-                        if verbs_count:
-                            sorted_verbs = sorted(verbs_count.items(), key=lambda x: x[1], reverse=True)
-                            output_lines.append("\n### よく出てくる動詞")
-                            for verb, count in sorted_verbs[:15]:
-                                output_lines.append(f"- {verb}: {count}回")
-
-                        if verb_chains:
-                            output_lines.append("\n### 動詞チェーン（体験の流れ）")
-                            for chain in verb_chains[-10:]:
-                                output_lines.append(f"- {'→'.join(chain)}")
-
-                        if arguments.get("clear", False):
-                            os.remove(buf_path)
-                            output_lines.append("\n(バッファをクリアしました)")
-
-                        return [TextContent(type="text", text="\n".join(output_lines))]
+                    # dream: removed (buffer check covered by crystallize)
 
                     case "update_diary":
                         mid = arguments.get("memory_id", "")

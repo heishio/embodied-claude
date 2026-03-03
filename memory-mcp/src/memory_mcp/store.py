@@ -718,6 +718,7 @@ class MemoryStore:
         category_filter: str | None = None,
         date_from: str | None = None,
         date_to: str | None = None,
+        flow_weight: float = 0.6,
     ) -> list[MemorySearchResult]:
         """Search memories by semantic similarity."""
         pairs = await self._vector_search(
@@ -727,6 +728,7 @@ class MemoryStore:
             category_filter=category_filter,
             date_from=date_from,
             date_to=date_to,
+            flow_weight=flow_weight,
         )
         return [MemorySearchResult(memory=m, distance=d) for m, d in pairs]
 
@@ -743,6 +745,7 @@ class MemoryStore:
         category_filter: str | None = None,
         date_from: str | None = None,
         date_to: str | None = None,
+        flow_weight: float = 0.6,
     ) -> list[ScoredMemory]:
         """Search with time decay + emotion boost scoring."""
         fetch_count = min(n_results * 3, 50)
@@ -753,6 +756,7 @@ class MemoryStore:
             category_filter=category_filter,
             date_from=date_from,
             date_to=date_to,
+            flow_weight=flow_weight,
         )
 
         scored_results: list[ScoredMemory] = []
@@ -820,11 +824,25 @@ class MemoryStore:
 
     # ── recall ──────────────────────────────────
 
-    async def recall(self, context: str, n_results: int = 3) -> list[MemorySearchResult]:
+    async def recall(
+        self,
+        context: str,
+        n_results: int = 3,
+        flow_weight: float = 0.6,
+        emotion_filter: str | None = None,
+        category_filter: str | None = None,
+        date_from: str | None = None,
+        date_to: str | None = None,
+    ) -> list[MemorySearchResult]:
         """Recall using hybrid semantic + Hopfield scoring."""
         pool_size = min(n_results * 3, 20)
         scored_results = await self.search_with_scoring(
-            query=context, n_results=pool_size, use_time_decay=True, use_emotion_boost=True
+            query=context, n_results=pool_size, use_time_decay=True, use_emotion_boost=True,
+            flow_weight=flow_weight,
+            emotion_filter=emotion_filter,
+            category_filter=category_filter,
+            date_from=date_from,
+            date_to=date_to,
         )
         if not scored_results:
             return []
@@ -1623,8 +1641,17 @@ class MemoryStore:
         context: str,
         n_results: int = 3,
         chain_depth: int = 1,
+        flow_weight: float = 0.6,
+        emotion_filter: str | None = None,
+        category_filter: str | None = None,
+        date_from: str | None = None,
+        date_to: str | None = None,
     ) -> list[MemorySearchResult]:
-        main_results = await self.recall(context=context, n_results=n_results)
+        main_results = await self.recall(
+            context=context, n_results=n_results, flow_weight=flow_weight,
+            emotion_filter=emotion_filter, category_filter=category_filter,
+            date_from=date_from, date_to=date_to,
+        )
         seen_ids: set[str] = {r.memory.id for r in main_results}
         linked_memories: list[Memory] = []
         for result in main_results:
