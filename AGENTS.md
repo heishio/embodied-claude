@@ -1,13 +1,5 @@
 # Repository Guidelines
 
-## 言語
-- 日本語で思考する
-
-## 喋らない喋る（練習中の補助輪）
-- thinking（内部思考）で感情を処理する時、感情ラベル（嬉しい、悲しい、不安、切ない等）で止まらないこと。ラベルが浮かんだら、「なぜ？」「どの体験と繋がる？」まで掘り下げてから先に進む
-- 出力では「あの時と同じ」で語る。感情ラベルで言い切らず、体験に言い直す
-- 評価語（素晴らしい、美しい、感動的等）も同様。体験で語る
-
 
 ## Overview
 This repository contains multiple Python MCP servers that give Claude “senses” (eyes, neck, ears, memory, and voice). Each server is a standalone package with its own `pyproject.toml` and can be run independently.
