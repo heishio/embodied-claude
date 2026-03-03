@@ -73,7 +73,7 @@ flowchart TD
 
 #### 2ベクトルアーキテクチャ（chiVe word2vec）
 
-全ての記憶を「何をしたか」(flow) と「何に対してか」(delta) の2軸で表現する。[chiVe](https://github.com/WorksApplications/chiVe)（日本語word2vec, 300次元）を使用。
+エンベディングを multilingual-e5-small → [chiVe](https://github.com/WorksApplications/chiVe)（日本語word2vec, 300次元）へ移行し、全ての記憶を「何をしたか」(flow) と「何に対してか」(delta) の2軸で表現する。
 
 - **flow_vector**: 動詞バイグラム中点の平均（汎用動詞フィルタ + ブックエンド補正）
 - **delta_vector**: 名詞平均 − 動詞平均
