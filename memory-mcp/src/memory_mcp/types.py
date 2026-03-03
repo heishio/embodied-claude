@@ -1,7 +1,7 @@
 """Type definitions for Memory MCP Server."""
 
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
 from typing import Any
 
@@ -17,47 +17,6 @@ class Category(str, Enum):
     FEELING = "feeling"
     CONVERSATION = "conversation"
     CURIOSITY = "curiosity"
-
-
-# Phase 5: 因果リンク
-
-
-class LinkType(str, Enum):
-    """リンクタイプ."""
-
-    SIMILAR = "similar"  # 類似（従来の自動リンク）
-    CAUSED_BY = "caused_by"  # この記憶の原因
-    LEADS_TO = "leads_to"  # この記憶から派生
-    RELATED = "related"  # 一般的な関連
-
-
-@dataclass(frozen=True)
-class MemoryLink:
-    """記憶間のリンク."""
-
-    target_id: str
-    link_type: str  # LinkType.value
-    created_at: str  # ISO 8601
-    note: str | None = None  # リンクの説明（任意）
-
-    def to_dict(self) -> dict[str, Any]:
-        """Convert to dictionary."""
-        return {
-            "target_id": self.target_id,
-            "link_type": self.link_type,
-            "created_at": self.created_at,
-            "note": self.note,
-        }
-
-    @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "MemoryLink":
-        """Create from dictionary."""
-        return cls(
-            target_id=data["target_id"],
-            link_type=data["link_type"],
-            created_at=data["created_at"],
-            note=data.get("note"),
-        )
 
 
 # Phase 4: エピソード記憶・感覚データ統合
@@ -193,21 +152,16 @@ class Memory:
     # Phase 2: アクセス追跡
     access_count: int = 0  # 想起回数
     last_accessed: str = ""  # 最終アクセス時刻（ISO 8601）
-    # Phase 3: 連想リンク
-    linked_ids: tuple[str, ...] = ()  # リンク先の記憶ID群
     # Phase 4: エピソード記憶・感覚データ統合
     episode_id: str | None = None  # 所属エピソード
     sensory_data: tuple[SensoryData, ...] = ()  # 感覚データ
     camera_position: CameraPosition | None = None  # カメラ位置
     tags: tuple[str, ...] = ()  # 自由形式タグ
-    # Phase 5: 因果リンク
-    links: tuple[MemoryLink, ...] = ()  # 構造化リンク
     # Phase 6: 発散想起・予測符号化
     novelty_score: float = 0.0
     prediction_error: float = 0.0
     activation_count: int = 0
     last_activated: str = ""
-    coactivation_weights: tuple[tuple[str, float], ...] = field(default_factory=tuple)
     # 記憶の鮮度（心理的時間距離）
     freshness: float = 1.0  # 1.0=さっき, 0.01=ずっと前
     # 合成レベル（0=生の記憶, 1=一層目合成, 2+=将来の多層化用）
@@ -224,7 +178,6 @@ class Memory:
             "category": self.category,
             "access_count": self.access_count,
             "last_accessed": self.last_accessed,
-            "linked_ids": ",".join(self.linked_ids),
             # Phase 4 フィールド
             "episode_id": self.episode_id or "",
             "sensory_data": json.dumps([s.to_dict() for s in self.sensory_data]),
@@ -234,14 +187,11 @@ class Memory:
                 else ""
             ),
             "tags": ",".join(self.tags),
-            # Phase 5: 因果リンク
-            "links": json.dumps([link.to_dict() for link in self.links]),
             # Phase 6: 発散想起・予測符号化
             "novelty_score": self.novelty_score,
             "prediction_error": self.prediction_error,
             "activation_count": self.activation_count,
             "last_activated": self.last_activated,
-            "coactivation": json.dumps(dict(self.coactivation_weights)),
         }
         return metadata
 

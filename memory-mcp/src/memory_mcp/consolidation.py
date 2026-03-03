@@ -28,15 +28,11 @@ class ConsolidationStats:
     """Summary statistics for replay execution."""
 
     replay_events: int
-    coactivation_updates: int
-    link_updates: int
     refreshed_memories: int
 
     def to_dict(self) -> dict[str, int]:
         return {
             "replay_events": self.replay_events,
-            "coactivation_updates": self.coactivation_updates,
-            "link_updates": self.link_updates,
             "refreshed_memories": self.refreshed_memories,
         }
 
@@ -56,11 +52,9 @@ class ConsolidationEngine:
         recent = [m for m in recent if self._is_after(m, cutoff)]
 
         if len(recent) < 2:
-            return ConsolidationStats(0, 0, 0, len(recent))
+            return ConsolidationStats(0, len(recent))
 
         replay_events = 0
-        coactivation_updates = 0
-        link_updates = 0
         refreshed_ids: set[str] = set()
 
         for idx in range(len(recent) - 1):
@@ -70,19 +64,12 @@ class ConsolidationEngine:
             left = recent[idx]
             right = recent[idx + 1]
 
-            delta = max(0.05, min(1.0, link_update_strength))
-            await store.bump_coactivation(left.id, right.id, delta=delta)
-            coactivation_updates += 2
-
             left_error = max(0.0, left.prediction_error * 0.9)
             right_error = max(0.0, right.prediction_error * 0.9)
             await store.record_activation(left.id, prediction_error=left_error)
             await store.record_activation(right.id, prediction_error=right_error)
             refreshed_ids.add(left.id)
             refreshed_ids.add(right.id)
-
-            if await store.maybe_add_related_link(left.id, right.id, threshold=0.6):
-                link_updates += 1
 
             replay_events += 1
 
@@ -91,8 +78,6 @@ class ConsolidationEngine:
 
         return ConsolidationStats(
             replay_events=replay_events,
-            coactivation_updates=coactivation_updates,
-            link_updates=link_updates,
             refreshed_memories=len(refreshed_ids),
         )
 

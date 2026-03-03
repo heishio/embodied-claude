@@ -15,13 +15,13 @@ class TestDivergentRecall:
         self,
         memory_store: MemoryStore,
     ):
-        first = await memory_store.save(
+        await memory_store.save(
             content="朝の空をカメラで探した",
             emotion="5",
             category="observation",
             tags=("camera", "sky"),
         )
-        second = await memory_store.save(
+        await memory_store.save(
             content="窓の位置を変えて空を見つけた",
             emotion="1",
             category="observation",
@@ -32,7 +32,6 @@ class TestDivergentRecall:
             emotion="8",
             category="daily",
         )
-        await memory_store.add_causal_link(first.id, second.id, link_type="related")
 
         results, diagnostics = await memory_store.recall_divergent(
             context="空を探すカメラの話",
@@ -59,7 +58,7 @@ class TestDivergentRecall:
             sample_size=10,
         )
 
-        assert "adaptive_branch_limit" in diagnostics
+        assert "selected_count" in diagnostics
         assert "avg_prediction_error" in diagnostics
 
 
@@ -67,13 +66,13 @@ class TestConsolidation:
     """Consolidation replay tests."""
 
     @pytest.mark.asyncio
-    async def test_consolidate_memories_updates_activation_and_coactivation(
+    async def test_consolidate_memories_updates_activation(
         self,
         memory_store: MemoryStore,
     ):
         first = await memory_store.save(content="朝の観察を記録した", category="observation")
         await asyncio.sleep(0.01)
-        second = await memory_store.save(content="窓辺で空を見た", category="observation")
+        await memory_store.save(content="窓辺で空を見た", category="observation")
 
         stats = await memory_store.consolidate_memories(
             window_hours=1,
@@ -83,8 +82,5 @@ class TestConsolidation:
 
         assert stats["replay_events"] > 0
         updated_first = await memory_store.get_by_id(first.id)
-        updated_second = await memory_store.get_by_id(second.id)
         assert updated_first is not None
-        assert updated_second is not None
         assert updated_first.activation_count >= 1
-        assert any(item_id == second.id for item_id, _ in updated_first.coactivation_weights)

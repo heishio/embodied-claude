@@ -11,11 +11,6 @@ from typing import Any
 
 import numpy as np
 
-from .association import (
-    AssociationDiagnostics,
-    AssociationEngine,
-    adaptive_search_params,
-)
 from .bm25 import BM25Index
 from .chive import ChiVeEmbedding
 from .config import MemoryConfig
@@ -39,7 +34,6 @@ from .types import (
     CameraPosition,
     Episode,
     Memory,
-    MemoryLink,
     MemorySearchResult,
     MemoryStats,
     ScoredMemory,
@@ -93,15 +87,6 @@ CREATE TABLE IF NOT EXISTS embeddings (
     flow_vector BLOB,
     delta_vector BLOB
 );
-
-CREATE TABLE IF NOT EXISTS coactivation (
-    source_id TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
-    target_id TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
-    weight REAL NOT NULL CHECK(weight >= 0.0 AND weight <= 1.0),
-    PRIMARY KEY (source_id, target_id)
-);
-CREATE INDEX IF NOT EXISTS idx_coactivation_source ON coactivation(source_id);
-CREATE INDEX IF NOT EXISTS idx_coactivation_target ON coactivation(target_id);
 
 CREATE TABLE IF NOT EXISTS episodes (
     id TEXT PRIMARY KEY,
@@ -231,12 +216,6 @@ CREATE INDEX IF NOT EXISTS idx_intersections_type ON composite_intersections(int
 # ──────────────────────────────────────────────
 
 
-def _parse_linked_ids(linked_ids_str: str) -> tuple[str, ...]:
-    if not linked_ids_str:
-        return ()
-    return tuple(id.strip() for id in linked_ids_str.split(",") if id.strip())
-
-
 def _parse_sensory_data(sensory_data_json: str) -> tuple[SensoryData, ...]:
     if not sensory_data_json:
         return ()
@@ -263,17 +242,7 @@ def _parse_tags(tags_str: str) -> tuple[str, ...]:
     return tuple(tag.strip() for tag in tags_str.split(",") if tag.strip())
 
 
-def _parse_links(links_json: str) -> tuple[MemoryLink, ...]:
-    if not links_json:
-        return ()
-    try:
-        data_list = json.loads(links_json)
-        return tuple(MemoryLink.from_dict(d) for d in data_list)
-    except (json.JSONDecodeError, KeyError, TypeError):
-        return ()
-
-
-def _row_to_memory(row: sqlite3.Row, coactivation: tuple[tuple[str, float], ...] = ()) -> Memory:
+def _row_to_memory(row: sqlite3.Row) -> Memory:
     """Convert a SQLite Row from the memories table to a Memory object."""
     episode_id_raw = row["episode_id"]
     episode_id = episode_id_raw if episode_id_raw else None
@@ -287,17 +256,14 @@ def _row_to_memory(row: sqlite3.Row, coactivation: tuple[tuple[str, float], ...]
         category=row["category"],
         access_count=row["access_count"],
         last_accessed=row["last_accessed"] or "",
-        linked_ids=_parse_linked_ids(row["linked_ids"] or ""),
         episode_id=episode_id,
         sensory_data=_parse_sensory_data(row["sensory_data"] or ""),
         camera_position=_parse_camera_position(row["camera_position"]),
         tags=_parse_tags(row["tags"] or ""),
-        links=_parse_links(row["links"] or ""),
         novelty_score=float(row["novelty_score"] or 0.0),
         prediction_error=float(row["prediction_error"] or 0.0),
         activation_count=int(row["activation_count"] or 0),
         last_activated=row["last_activated"] or "",
-        coactivation_weights=coactivation,
         freshness=float(row["freshness"]) if row["freshness"] is not None else 1.0,
         level=int(row["level"]) if row["level"] is not None else 0,
     )
@@ -334,7 +300,6 @@ class MemoryStore:
         self._db: sqlite3.Connection | None = None
         self._lock = asyncio.Lock()
         self._working_memory = WorkingMemoryBuffer(capacity=20)
-        self._association_engine = AssociationEngine()
         self._consolidation_engine = ConsolidationEngine()
         self._hopfield = ModernHopfieldNetwork(beta=4.0, n_iters=3)
         self._chive = chive
@@ -497,23 +462,13 @@ class MemoryStore:
         """Encode text into (flow_vector, delta_vector) using chiVe."""
         return await asyncio.to_thread(self._encode_text_sync, text)
 
-    # ── Coactivation helpers ────────────────────
-
-    def _get_coactivation(self, db: sqlite3.Connection, memory_id: str) -> tuple[tuple[str, float], ...]:
-        rows = db.execute(
-            "SELECT target_id, weight FROM coactivation WHERE source_id = ?",
-            (memory_id,),
-        ).fetchall()
-        return tuple((row["target_id"], float(row["weight"])) for row in rows)
-
     # ── Fetch helpers ───────────────────────────
 
     def _fetch_memory_by_id(self, db: sqlite3.Connection, memory_id: str) -> Memory | None:
         row = db.execute("SELECT * FROM memories WHERE id = ?", (memory_id,)).fetchone()
         if row is None:
             return None
-        coactivation = self._get_coactivation(db, memory_id)
-        return _row_to_memory(row, coactivation)
+        return _row_to_memory(row)
 
     def _fetch_memories_by_ids_sync(self, db: sqlite3.Connection, memory_ids: list[str]) -> list[Memory]:
         if not memory_ids:
@@ -522,11 +477,7 @@ class MemoryStore:
         rows = db.execute(
             f"SELECT * FROM memories WHERE id IN ({placeholders})", memory_ids
         ).fetchall()
-        memories: list[Memory] = []
-        for row in rows:
-            coactivation = self._get_coactivation(db, row["id"])
-            memories.append(_row_to_memory(row, coactivation))
-        return memories
+        return [_row_to_memory(row) for row in rows]
 
     # ── Save ────────────────────────────────────
 
@@ -600,10 +551,10 @@ class MemoryStore:
                     memory_id, content, normalized_content, timestamp,
                     emotion, importance, category,
                     meta.get("access_count", 0), meta.get("last_accessed", ""),
-                    meta.get("linked_ids", ""), episode_id or None,
+                    "", episode_id or None,
                     meta.get("sensory_data", ""),
                     meta.get("camera_position") or None,
-                    meta.get("tags", ""), meta.get("links", ""),
+                    meta.get("tags", ""), "",
                     0.0, 0.0, 0, "", reading, 1.0, 0,
                 ),
             )
@@ -700,9 +651,7 @@ class MemoryStore:
         results: list[tuple[Memory, float]] = []
         for idx, sim in scored:
             row = rows_with_vecs[idx][0]
-            memory_id = row["id"]
-            coactivation = await asyncio.to_thread(self._get_coactivation, db, memory_id)
-            memory = _row_to_memory(row, coactivation)
+            memory = _row_to_memory(row)
             distance = float(1.0 - sim)
             results.append((memory, distance))
 
@@ -883,11 +832,7 @@ class MemoryStore:
             ).fetchall()
 
         rows = await asyncio.to_thread(_fetch)
-        memories: list[Memory] = []
-        for row in rows:
-            coactivation = await asyncio.to_thread(self._get_coactivation, db, row["id"])
-            memories.append(_row_to_memory(row, coactivation))
-        return memories
+        return [_row_to_memory(row) for row in rows]
 
     # ── get_stats ───────────────────────────────
 
@@ -947,11 +892,7 @@ class MemoryStore:
 
         def _fetch() -> list[Memory]:
             rows = db.execute("SELECT * FROM memories").fetchall()
-            memories: list[Memory] = []
-            for row in rows:
-                coactivation = self._get_coactivation(db, row["id"])
-                memories.append(_row_to_memory(row, coactivation))
-            return memories
+            return [_row_to_memory(row) for row in rows]
 
         return await asyncio.to_thread(_fetch)
 
@@ -1097,8 +1038,8 @@ class MemoryStore:
         db = self._ensure_connected()
 
         valid_cols = {
-            "access_count", "last_accessed", "linked_ids", "episode_id",
-            "sensory_data", "camera_position", "tags", "links",
+            "access_count", "last_accessed", "episode_id",
+            "sensory_data", "camera_position", "tags",
             "novelty_score", "prediction_error", "activation_count",
             "last_activated", "reading",
         }
@@ -1133,68 +1074,6 @@ class MemoryStore:
         if prediction_error is not None:
             payload["prediction_error"] = max(0.0, min(1.0, prediction_error))
         return await self.update_memory_fields(memory_id, **payload)
-
-    # ── bump_coactivation ───────────────────────
-
-    async def bump_coactivation(
-        self,
-        source_id: str,
-        target_id: str,
-        delta: float = 0.1,
-    ) -> bool:
-        """Increment coactivation weights symmetrically."""
-        db = self._ensure_connected()
-
-        source = await self.get_by_id(source_id)
-        target = await self.get_by_id(target_id)
-        if source is None or target is None:
-            return False
-
-        delta = max(0.0, min(1.0, delta))
-
-        def _bump() -> None:
-            for s_id, t_id in [(source_id, target_id), (target_id, source_id)]:
-                row = db.execute(
-                    "SELECT weight FROM coactivation WHERE source_id = ? AND target_id = ?",
-                    (s_id, t_id),
-                ).fetchone()
-                current = float(row["weight"]) if row else 0.0
-                new_weight = max(0.0, min(1.0, current + delta))
-                db.execute(
-                    """INSERT INTO coactivation (source_id, target_id, weight)
-                       VALUES (?, ?, ?)
-                       ON CONFLICT(source_id, target_id) DO UPDATE SET weight = excluded.weight""",
-                    (s_id, t_id, new_weight),
-                )
-            db.commit()
-
-        await asyncio.to_thread(_bump)
-        return True
-
-    # ── maybe_add_related_link ──────────────────
-
-    async def maybe_add_related_link(
-        self,
-        source_id: str,
-        target_id: str,
-        threshold: float = 0.6,
-    ) -> bool:
-        db = self._ensure_connected()
-        row = await asyncio.to_thread(
-            db.execute,
-            "SELECT weight FROM coactivation WHERE source_id = ? AND target_id = ?",
-            (source_id, target_id),
-        )
-        r = row.fetchone()
-        if r is None or float(r["weight"]) < threshold:
-            return False
-        await self.add_causal_link(
-            source_id=source_id,
-            target_id=target_id,
-            link_type="related",
-            note="auto-linked by consolidation replay",
-        )
-        return True
 
     # ── Recall Index (pre-computed word→memory similarity) ──
 
@@ -1502,238 +1381,6 @@ class MemoryStore:
         updated = await asyncio.to_thread(_update_entries)
         return updated
 
-    # ── save_with_auto_link ─────────────────────
-
-    async def save_with_auto_link(
-        self,
-        content: str,
-        emotion: str = "8",
-        importance: int = 3,
-        category: str = "daily",
-        link_threshold: float = 0.8,
-        max_links: int = 5,
-    ) -> Memory:
-        similar_memories = await self.search(query=content, n_results=max_links)
-        memories_to_link = [r.memory for r in similar_memories if r.distance <= link_threshold]
-        linked_ids = tuple(m.id for m in memories_to_link)
-
-        db = self._ensure_connected()
-        memory_id = str(uuid.uuid4())
-        timestamp = datetime.now(timezone.utc).isoformat()
-        importance = max(1, min(5, importance))
-
-        memory = Memory(
-            id=memory_id,
-            content=content,
-            timestamp=timestamp,
-            emotion=emotion,
-            importance=importance,
-            category=category,
-            linked_ids=linked_ids,
-        )
-
-        normalized_content = normalize_japanese(content)
-        reading = get_reading(content)
-        flow_vec, delta_vec = await self._encode_text(normalized_content)
-        concat_vec = np.concatenate([flow_vec, delta_vec])
-        vector_blob = encode_vector(concat_vec)
-        flow_blob = encode_vector(flow_vec)
-        delta_blob = encode_vector(delta_vec)
-
-        def _insert() -> None:
-            meta = memory.to_metadata()
-            # Decay freshness only for post-consolidation memories
-            cutoff = db.execute(
-                "SELECT COALESCE((SELECT value FROM meta WHERE key = 'last_consolidated_at'), '')"
-            ).fetchone()[0]
-            if cutoff:
-                db.execute(
-                    "UPDATE memories SET freshness = MAX(0.01, freshness - 0.003) WHERE timestamp > ?",
-                    (cutoff,),
-                )
-                db.execute(
-                    "UPDATE verb_chains SET freshness = MAX(0.01, freshness - 0.003) WHERE timestamp > ?",
-                    (cutoff,),
-                )
-            else:
-                db.execute("UPDATE memories SET freshness = MAX(0.01, freshness - 0.003)")
-                db.execute("UPDATE verb_chains SET freshness = MAX(0.01, freshness - 0.003)")
-            db.execute(
-                """INSERT INTO memories (
-                    id, content, normalized_content, timestamp,
-                    emotion, importance, category, access_count, last_accessed,
-                    linked_ids, episode_id, sensory_data, camera_position,
-                    tags, links, novelty_score, prediction_error,
-                    activation_count, last_activated, reading, freshness
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (
-                    memory_id, content, normalized_content, timestamp,
-                    emotion, importance, category,
-                    0, "",
-                    meta.get("linked_ids", ""), None,
-                    "", None, "", "", 0.0, 0.0, 0, "", reading, 1.0,
-                ),
-            )
-            db.execute(
-                "INSERT INTO embeddings (memory_id, vector, flow_vector, delta_vector) VALUES (?,?,?,?)",
-                (memory_id, vector_blob, flow_blob, delta_blob),
-            )
-            db.commit()
-
-        await asyncio.to_thread(_insert)
-        self._bm25_index.mark_dirty()
-
-        for target_id in linked_ids:
-            await self._add_bidirectional_link(memory_id, target_id)
-
-        return memory
-
-    # ── _add_bidirectional_link ─────────────────
-
-    async def _add_bidirectional_link(self, source_id: str, target_id: str) -> None:
-        db = self._ensure_connected()
-
-        def _link() -> None:
-            for mem_id, other_id in [(source_id, target_id), (target_id, source_id)]:
-                row = db.execute("SELECT linked_ids FROM memories WHERE id = ?", (mem_id,)).fetchone()
-                if row is None:
-                    continue
-                current = _parse_linked_ids(row["linked_ids"] or "")
-                if other_id not in current:
-                    new_linked = ",".join(current + (other_id,))
-                    db.execute("UPDATE memories SET linked_ids = ? WHERE id = ?", (new_linked, mem_id))
-            db.commit()
-
-        await asyncio.to_thread(_link)
-
-    # ── get_linked_memories ─────────────────────
-
-    async def get_linked_memories(self, memory_id: str, depth: int = 1) -> list[Memory]:
-        depth = max(1, min(5, depth))
-        visited: set[str] = set()
-        result: list[Memory] = []
-        current_ids = [memory_id]
-
-        for _ in range(depth):
-            next_ids: list[str] = []
-            for mem_id in current_ids:
-                if mem_id in visited:
-                    continue
-                visited.add(mem_id)
-                memory = await self.get_by_id(mem_id)
-                if memory is None:
-                    continue
-                if mem_id != memory_id:
-                    result.append(memory)
-                for linked_id in memory.linked_ids:
-                    if linked_id not in visited:
-                        next_ids.append(linked_id)
-            current_ids = next_ids
-            if not current_ids:
-                break
-
-        return result
-
-    # ── recall_with_chain ───────────────────────
-
-    async def recall_with_chain(
-        self,
-        context: str,
-        n_results: int = 3,
-        chain_depth: int = 1,
-        flow_weight: float = 0.6,
-        emotion_filter: str | None = None,
-        category_filter: str | None = None,
-        date_from: str | None = None,
-        date_to: str | None = None,
-    ) -> list[MemorySearchResult]:
-        main_results = await self.recall(
-            context=context, n_results=n_results, flow_weight=flow_weight,
-            emotion_filter=emotion_filter, category_filter=category_filter,
-            date_from=date_from, date_to=date_to,
-        )
-        seen_ids: set[str] = {r.memory.id for r in main_results}
-        linked_memories: list[Memory] = []
-        for result in main_results:
-            linked = await self.get_linked_memories(memory_id=result.memory.id, depth=chain_depth)
-            for mem in linked:
-                if mem.id not in seen_ids:
-                    seen_ids.add(mem.id)
-                    linked_memories.append(mem)
-        linked_results = [MemorySearchResult(memory=mem, distance=999.0) for mem in linked_memories]
-        return main_results + linked_results
-
-    # ── add_causal_link ─────────────────────────
-
-    async def add_causal_link(
-        self,
-        source_id: str,
-        target_id: str,
-        link_type: str = "caused_by",
-        note: str | None = None,
-    ) -> None:
-        source_memory = await self.get_by_id(source_id)
-        if source_memory is None:
-            raise ValueError(f"Source memory not found: {source_id}")
-        target_memory = await self.get_by_id(target_id)
-        if target_memory is None:
-            raise ValueError(f"Target memory not found: {target_id}")
-
-        new_link = MemoryLink(
-            target_id=target_id,
-            link_type=link_type,
-            created_at=datetime.now(timezone.utc).isoformat(),
-            note=note,
-        )
-        existing_links = list(source_memory.links)
-        for link in existing_links:
-            if link.target_id == target_id and link.link_type == link_type:
-                return
-        updated_links = tuple(existing_links + [new_link])
-        links_json = json.dumps([link.to_dict() for link in updated_links])
-        await self.update_memory_fields(source_id, links=links_json)
-
-    # ── get_causal_chain ────────────────────────
-
-    async def get_causal_chain(
-        self,
-        memory_id: str,
-        direction: str = "backward",
-        max_depth: int = 5,
-    ) -> list[tuple[Memory, str]]:
-        max_depth = max(1, min(5, max_depth))
-        if direction == "backward":
-            target_link_types = {"caused_by"}
-        elif direction == "forward":
-            target_link_types = {"leads_to"}
-        else:
-            raise ValueError(f"Invalid direction: {direction}")
-
-        visited: set[str] = set()
-        result: list[tuple[Memory, str]] = []
-        current_ids = [memory_id]
-
-        for _ in range(max_depth):
-            next_ids: list[str] = []
-            for mem_id in current_ids:
-                if mem_id in visited:
-                    continue
-                visited.add(mem_id)
-                memory = await self.get_by_id(mem_id)
-                if memory is None:
-                    continue
-                for link in memory.links:
-                    if link.link_type in target_link_types:
-                        target = await self.get_by_id(link.target_id)
-                        if target and link.target_id not in visited:
-                            result.append((target, link.link_type))
-                            next_ids.append(link.target_id)
-            current_ids = next_ids
-            if not current_ids:
-                break
-
-        return result
-
     # ── search_important_memories ───────────────
 
     async def search_important_memories(
@@ -1759,11 +1406,7 @@ class MemoryStore:
                 f"SELECT * FROM memories WHERE {where} ORDER BY last_accessed DESC LIMIT ?",
                 params + [n_results],
             ).fetchall()
-            memories: list[Memory] = []
-            for row in rows:
-                coactivation = self._get_coactivation(db, row["id"])
-                memories.append(_row_to_memory(row, coactivation))
-            return memories
+            return [_row_to_memory(row) for row in rows]
 
         return await asyncio.to_thread(_fetch)
 
@@ -1864,24 +1507,11 @@ class MemoryStore:
         if not seeds:
             return [], {}
 
-        branch_limit, depth_limit = adaptive_search_params(
-            context=context,
-            requested_branches=max_branches,
-            requested_depth=max_depth,
-            seed_count=len(seeds),
-        )
-
         seed_memories = [item.memory for item in seeds]
-        expanded, assoc_diag = await self._association_engine.spread(
-            seeds=seed_memories,
-            fetch_memories_by_ids=self.get_by_ids,
-            max_branches=branch_limit,
-            max_depth=depth_limit,
-        )
 
         distance_map = {item.memory.id: item.semantic_distance for item in seeds}
         all_candidates: dict[str, Memory] = {}
-        for memory in seed_memories + expanded:
+        for memory in seed_memories:
             all_candidates[memory.id] = memory
 
         # ── Boundary-aware composite edge expansion ──
@@ -1967,12 +1597,9 @@ class MemoryStore:
 
         diagnostics = self._build_divergent_diagnostics(
             context=context,
-            association=assoc_diag,
             selected=selected_memories,
             prediction_errors=prediction_errors,
             novelty_scores=novelty_scores,
-            branch_limit=branch_limit,
-            depth_limit=depth_limit,
         )
         return results, diagnostics
 
@@ -2892,12 +2519,9 @@ class MemoryStore:
     def _build_divergent_diagnostics(
         self,
         context: str,
-        association: AssociationDiagnostics,
         selected: list[Memory],
         prediction_errors: list[float],
         novelty_scores: list[float],
-        branch_limit: int,
-        depth_limit: int,
     ) -> dict[str, Any]:
         avg_prediction_error = sum(prediction_errors) / len(prediction_errors) if prediction_errors else 0.0
         avg_novelty = sum(novelty_scores) / len(novelty_scores) if novelty_scores else 0.0
@@ -2907,13 +2531,6 @@ class MemoryStore:
         )
         return {
             "context": context,
-            "branches_used": association.branches_used,
-            "depth_used": association.depth_used,
-            "adaptive_branch_limit": branch_limit,
-            "adaptive_depth_limit": depth_limit,
-            "traversed_edges": association.traversed_edges,
-            "expanded_nodes": association.expanded_nodes,
-            "avg_branching_factor": association.avg_branching_factor,
             "selected_count": len(selected),
             "diversity_score": diversity_score(selected),
             "avg_prediction_error": predictive.avg_prediction_error,

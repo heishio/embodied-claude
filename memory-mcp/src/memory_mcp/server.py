@@ -120,18 +120,6 @@ class MemoryMCPServer:
                                 "default": "daily",
                                 "enum": ["daily", "philosophical", "technical", "memory", "observation", "feeling", "conversation", "curiosity"],
                             },
-                            "auto_link": {
-                                "type": "boolean",
-                                "description": "Automatically link to similar existing memories",
-                                "default": True,
-                            },
-                            "link_threshold": {
-                                "type": "number",
-                                "description": "Similarity threshold for auto-linking (0-2, lower means more similar required)",
-                                "default": 0.8,
-                                "minimum": 0,
-                                "maximum": 2,
-                            },
                             "image_path": {
                                 "type": "string",
                                 "description": "Path to image file (for visual memory)",
@@ -187,7 +175,7 @@ class MemoryMCPServer:
                 # search_memories: removed (merged into recall)
                 Tool(
                     name="recall",
-                    description="Automatically recall relevant memories based on the current conversation context. Use this to remember things that might be relevant. Set chain_depth >= 1 to also include linked/associated memories.",
+                    description="Automatically recall relevant memories based on the current conversation context. Use this to remember things that might be relevant.",
                     inputSchema={
                         "type": "object",
                         "properties": {
@@ -201,13 +189,6 @@ class MemoryMCPServer:
                                 "default": 3,
                                 "minimum": 1,
                                 "maximum": 10,
-                            },
-                            "chain_depth": {
-                                "type": "integer",
-                                "description": "How many levels of linked memories to follow (0=none, 1-3=with associations)",
-                                "default": 0,
-                                "minimum": 0,
-                                "maximum": 3,
                             },
                             "emotion_filter": {
                                 "type": "string",
@@ -646,25 +627,12 @@ class MemoryMCPServer:
                             ]
 
                         # Standard text memory path
-                        auto_link = arguments.get("auto_link", True)
-
-                        if auto_link:
-                            memory = await self._memory_store.save_with_auto_link(
-                                content=content,
-                                emotion=arguments.get("emotion", "8"),
-                                importance=arguments.get("importance", 3),
-                                category=arguments.get("category", "daily"),
-                                link_threshold=arguments.get("link_threshold", 0.8),
-                            )
-                            linked_info = f"\nLinked to: {len(memory.linked_ids)} memories"
-                        else:
-                            memory = await self._memory_store.save(
-                                content=content,
-                                emotion=arguments.get("emotion", "8"),
-                                importance=arguments.get("importance", 3),
-                                category=arguments.get("category", "daily"),
-                            )
-                            linked_info = ""
+                        memory = await self._memory_store.save(
+                            content=content,
+                            emotion=arguments.get("emotion", "8"),
+                            importance=arguments.get("importance", 3),
+                            category=arguments.get("category", "daily"),
+                        )
 
                         # Update recall index for new memory
                         try:
@@ -702,7 +670,7 @@ class MemoryMCPServer:
                         return [
                             TextContent(
                                 type="text",
-                                text=f"Diary entry saved!\nID: {memory.id}\nTimestamp: {memory.timestamp}\nEmotion: {memory.emotion}\nImportance: {memory.importance}\nCategory: {memory.category}{linked_info}{chain_info}",
+                                text=f"Diary entry saved!\nID: {memory.id}\nTimestamp: {memory.timestamp}\nEmotion: {memory.emotion}\nImportance: {memory.importance}\nCategory: {memory.category}{chain_info}",
                             )
                         ]
 
@@ -713,7 +681,6 @@ class MemoryMCPServer:
                         if not context:
                             return [TextContent(type="text", text="Error: context is required")]
 
-                        chain_depth = arguments.get("chain_depth", 0)
                         n_results = arguments.get("n_results", 3)
                         fmin = arguments.get("freshness_min")
                         fmax = arguments.get("freshness_max")
@@ -723,54 +690,6 @@ class MemoryMCPServer:
                         date_from = arguments.get("date_from")
                         date_to = arguments.get("date_to")
 
-                        if chain_depth >= 1:
-                            # With associations (merged recall_with_associations)
-                            results = await self._memory_store.recall_with_chain(
-                                context=context,
-                                n_results=n_results * (3 if fmin or fmax else 1),
-                                chain_depth=chain_depth,
-                                flow_weight=fw,
-                                emotion_filter=emotion_filter,
-                                category_filter=category_filter,
-                                date_from=date_from,
-                                date_to=date_to,
-                            )
-                            if fmin is not None or fmax is not None:
-                                results = [r for r in results if _freshness_filter(r.memory.freshness, fmin, fmax)]
-                                results = results[:n_results]
-
-                            if not results:
-                                return [TextContent(type="text", text="No relevant memories found.")]
-
-                            main_results = [r for r in results if r.distance < 900]
-                            linked_results = [r for r in results if r.distance >= 900]
-
-                            output_lines = [f"Recalled {len(main_results)} memories with {len(linked_results)} linked associations:\n"]
-
-                            output_lines.append("=== Primary Memories ===\n")
-                            for i, result in enumerate(main_results, 1):
-                                m = result.memory
-                                output_lines.append(
-                                    f"--- Memory {i} (score: {result.distance:.4f}) ---\n"
-                                    f"ID: {m.id}\n"
-                                    f"[{m.freshness:.2f}] [{m.emotion}]\n"
-                                    f"{m.content}\n"
-                                )
-
-                            if linked_results:
-                                output_lines.append("\n=== Linked Memories ===\n")
-                                for i, result in enumerate(linked_results, 1):
-                                    m = result.memory
-                                    output_lines.append(
-                                        f"--- Linked {i} ---\n"
-                                        f"ID: {m.id}\n"
-                                        f"[{m.freshness:.2f}] [{m.emotion}]\n"
-                                        f"{m.content}\n"
-                                    )
-
-                            return [TextContent(type="text", text="\n".join(output_lines))]
-
-                        # Standard recall (no associations)
                         results = await self._memory_store.recall(
                             context=context,
                             n_results=n_results * (3 if fmin or fmax else 1),
@@ -842,49 +761,6 @@ Date Range:
   Newest: {stats.newest_timestamp or 'N/A'}
 """
                         return [TextContent(type="text", text=output)]
-
-                    case "recall_with_associations":
-                        context = arguments.get("context", "")
-                        if not context:
-                            return [TextContent(type="text", text="Error: context is required")]
-
-                        results = await self._memory_store.recall_with_chain(
-                            context=context,
-                            n_results=arguments.get("n_results", 3),
-                            chain_depth=arguments.get("chain_depth", 1),
-                        )
-
-                        if not results:
-                            return [TextContent(type="text", text="No relevant memories found.")]
-
-                        # メイン結果と関連結果を分ける
-                        main_results = [r for r in results if r.distance < 900]
-                        linked_results = [r for r in results if r.distance >= 900]
-
-                        output_lines = [f"Recalled {len(main_results)} memories with {len(linked_results)} linked associations:\n"]
-
-                        output_lines.append("=== Primary Memories ===\n")
-                        for i, result in enumerate(main_results, 1):
-                            m = result.memory
-                            output_lines.append(
-                                f"--- Memory {i} (score: {result.distance:.4f}) ---\n"
-                                f"ID: {m.id}\n"
-                                f"[{m.freshness:.2f}] [{m.emotion}]\n"
-                                f"{m.content}\n"
-                            )
-
-                        if linked_results:
-                            output_lines.append("\n=== Linked Memories ===\n")
-                            for i, result in enumerate(linked_results, 1):
-                                m = result.memory
-                                output_lines.append(
-                                    f"--- Linked {i} ---\n"
-                                    f"ID: {m.id}\n"
-                                    f"[{m.freshness:.2f}] [{m.emotion}]\n"
-                                    f"{m.content}\n"
-                                )
-
-                        return [TextContent(type="text", text="\n".join(output_lines))]
 
                     case "recall_divergent":
                         context = arguments.get("context", "")
@@ -982,44 +858,6 @@ Date Range:
                                 f"{json.dumps(stats, indent=2, ensure_ascii=False)}",
                             )
                         ]
-
-                    case "get_memory_chain":
-                        memory_id = arguments.get("memory_id", "")
-                        if not memory_id:
-                            return [TextContent(type="text", text="Error: memory_id is required")]
-
-                        # 起点の記憶を取得
-                        start_memory = await self._memory_store.get_by_id(memory_id)
-                        if not start_memory:
-                            return [TextContent(type="text", text="Error: Memory not found")]
-
-                        linked_memories = await self._memory_store.get_linked_memories(
-                            memory_id=memory_id,
-                            depth=arguments.get("depth", 2),
-                        )
-
-                        output_lines = [f"Memory chain starting from {memory_id}:\n"]
-
-                        output_lines.append("=== Starting Memory ===\n")
-                        output_lines.append(
-                            f"ID: {start_memory.id}\n"
-                            f"[{start_memory.freshness:.2f}] [{start_memory.emotion}] [{start_memory.category}]\n"
-                            f"{start_memory.content}\n"
-                            f"Linked to: {len(start_memory.linked_ids)} memories\n"
-                        )
-
-                        if linked_memories:
-                            output_lines.append(f"\n=== Linked Memories ({len(linked_memories)}) ===\n")
-                            for i, m in enumerate(linked_memories, 1):
-                                output_lines.append(
-                                    f"--- {i}. {m.id[:8]}... ---\n"
-                                    f"[{m.freshness:.2f}] [{m.emotion}]\n"
-                                    f"{m.content}\n"
-                                )
-                        else:
-                            output_lines.append("\nNo linked memories found.\n")
-
-                        return [TextContent(type="text", text="\n".join(output_lines))]
 
                     # Phase 4: Episode Tools
                     case "create_episode":
@@ -1273,77 +1111,6 @@ Date Range:
                                 text=f"Working memory refreshed. Now contains {size} memories.",
                             )
                         ]
-
-                    # Phase 5: Causal Links
-                    case "link_memories":
-                        source_id = arguments.get("source_id", "")
-                        if not source_id:
-                            return [TextContent(type="text", text="Error: source_id is required")]
-
-                        target_id = arguments.get("target_id", "")
-                        if not target_id:
-                            return [TextContent(type="text", text="Error: target_id is required")]
-
-                        link_type = arguments.get("link_type", "caused_by")
-                        note = arguments.get("note")
-
-                        await self._memory_store.add_causal_link(
-                            source_id=source_id,
-                            target_id=target_id,
-                            link_type=link_type,
-                            note=note,
-                        )
-
-                        return [
-                            TextContent(
-                                type="text",
-                                text=f"Link created!\n"
-                                     f"Source: {source_id[:8]}...\n"
-                                     f"Target: {target_id[:8]}...\n"
-                                     f"Type: {link_type}\n"
-                                     f"Note: {note or '(none)'}",
-                            )
-                        ]
-
-                    case "get_causal_chain":
-                        memory_id = arguments.get("memory_id", "")
-                        if not memory_id:
-                            return [TextContent(type="text", text="Error: memory_id is required")]
-
-                        direction = arguments.get("direction", "backward")
-                        max_depth = arguments.get("max_depth", 3)
-
-                        # 起点の記憶を取得
-                        start_memory = await self._memory_store.get_by_id(memory_id)
-                        if not start_memory:
-                            return [TextContent(type="text", text="Error: Memory not found")]
-
-                        chain = await self._memory_store.get_causal_chain(
-                            memory_id=memory_id,
-                            direction=direction,
-                            max_depth=max_depth,
-                        )
-
-                        direction_label = "causes" if direction == "backward" else "effects"
-                        output_lines = [
-                            f"Causal chain ({direction_label}) starting from {memory_id[:8]}...:\n",
-                            "=== Starting Memory ===\n",
-                            f"[{start_memory.freshness:.2f}] [{start_memory.emotion}]\n",
-                            f"{start_memory.content}\n",
-                        ]
-
-                        if chain:
-                            output_lines.append(f"\n=== {direction_label.title()} ({len(chain)} memories) ===\n")
-                            for i, (mem, link_type) in enumerate(chain, 1):
-                                output_lines.append(
-                                    f"--- {i}. [{link_type}] {mem.id[:8]}... ---\n"
-                                    f"[{mem.freshness:.2f}] [{mem.emotion}]\n"
-                                    f"{mem.content}\n"
-                                )
-                        else:
-                            output_lines.append(f"\nNo {direction_label} found.\n")
-
-                        return [TextContent(type="text", text="\n".join(output_lines))]
 
                     # Category tools
                     case "create_category":

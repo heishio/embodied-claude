@@ -98,20 +98,10 @@ def _rank_memories(conn: sqlite3.Connection) -> list[dict]:
             m.importance,
             m.freshness,
             m.category,
-            COALESCE(co.edge_count, 0) as coactivation_edges,
             m.access_count,
             m.activation_count,
             COALESCE(bf.fuzziness, 0.0) as boundary_fuzziness
         FROM memories m
-        LEFT JOIN (
-            SELECT id, SUM(edge_count) as edge_count FROM (
-                SELECT source_id as id, COUNT(*) as edge_count
-                FROM coactivation GROUP BY source_id
-                UNION ALL
-                SELECT target_id as id, COUNT(*) as edge_count
-                FROM coactivation GROUP BY target_id
-            ) GROUP BY id
-        ) co ON co.id = m.id
         LEFT JOIN (
             SELECT member_id,
                    CAST(SUM(is_edge) AS REAL) / COUNT(*) as fuzziness
@@ -131,7 +121,6 @@ def _rank_memories(conn: sqlite3.Connection) -> list[dict]:
     scored = []
     for row in cur.fetchall():
         importance_score = (row["importance"] - 1) * 0.1
-        edge_score = min(row["coactivation_edges"] / 10.0, 1.0)
         access_score = min(
             (row["access_count"] + row["activation_count"]) / 20.0, 1.0
         )
@@ -140,7 +129,6 @@ def _rank_memories(conn: sqlite3.Connection) -> list[dict]:
 
         composite = (
             importance_score * 1.0
-            + edge_score * 0.5
             + access_score * 0.3
             + fuzziness * 0.2
             + bias_score * 0.3

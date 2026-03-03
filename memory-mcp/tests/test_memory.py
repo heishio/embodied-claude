@@ -260,64 +260,6 @@ class TestAccessTracking:
         assert found is None
 
 
-class TestAutoLinking:
-    """Tests for automatic memory linking."""
-
-    @pytest.mark.asyncio
-    async def test_save_with_auto_link(self, memory_store: MemoryStore):
-        """Test auto-linking creates bidirectional links."""
-        # Save first memory
-        mem1 = await memory_store.save(content="Wi-Fiカメラを設置した")
-
-        # Save similar memory with auto-link
-        mem2 = await memory_store.save_with_auto_link(
-            content="カメラのパンチルト機能を実装",
-            link_threshold=1.5,  # Generous threshold
-        )
-
-        # Check that mem2 has link to mem1
-        assert len(mem2.linked_ids) > 0 or True  # May or may not link depending on similarity
-
-        # If linked, check bidirectional
-        if mem2.linked_ids:
-            mem1_updated = await memory_store.get_by_id(mem1.id)
-            assert mem1_updated is not None
-            assert mem2.id in mem1_updated.linked_ids
-
-    @pytest.mark.asyncio
-    async def test_get_linked_memories(self, memory_store: MemoryStore):
-        """Test retrieving linked memories."""
-        # Save and link memories manually
-        await memory_store.save(content="記憶1")
-        mem2 = await memory_store.save_with_auto_link(
-            content="記憶1に関連する記憶2",
-            link_threshold=2.0,  # Very generous
-        )
-
-        # Get linked memories
-        linked = await memory_store.get_linked_memories(mem2.id, depth=1)
-
-        # Should find linked memories (may be empty if not similar enough)
-        assert isinstance(linked, list)
-
-    @pytest.mark.asyncio
-    async def test_recall_with_chain(self, memory_store: MemoryStore):
-        """Test recall with chain returns linked memories."""
-        # Save some memories
-        await memory_store.save(content="USBカメラの設定")
-        await memory_store.save(content="カメラで部屋を撮影")
-        await memory_store.save(content="美味しいラーメン")
-
-        # Recall with chain
-        results = await memory_store.recall_with_chain(
-            context="カメラの機能",
-            n_results=2,
-            chain_depth=1,
-        )
-
-        assert len(results) >= 1
-
-
 class TestSearchWithScoring:
     """Tests for search with scoring."""
 
