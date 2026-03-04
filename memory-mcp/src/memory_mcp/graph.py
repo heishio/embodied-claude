@@ -338,21 +338,14 @@ class MemoryGraph:
                 "UPDATE graph_edges SET weight = weight * ?", (decay_factor,)
             )
 
-            # Normalize: pull outliers 10% toward mean per from_id
-            rows = self._db.execute(
-                """SELECT from_id, AVG(weight) as avg_w
-                   FROM graph_edges GROUP BY from_id"""
-            ).fetchall()
-            for r in rows:
-                from_id = r[0] if isinstance(r, tuple) else r["from_id"]
-                avg_w = float(r[1] if isinstance(r, tuple) else r["avg_w"])
-                # Pull each edge 50% toward the average
-                self._db.execute(
-                    """UPDATE graph_edges
-                       SET weight = weight + 0.5 * (? - weight)
-                       WHERE from_id = ?""",
-                    (avg_w, from_id),
-                )
+            # Normalize: pull each edge 10% toward per-from_id average (single SQL)
+            self._db.execute(
+                """UPDATE graph_edges
+                   SET weight = weight + 0.1 * (
+                       (SELECT AVG(e2.weight) FROM graph_edges e2
+                        WHERE e2.from_id = graph_edges.from_id) - weight
+                   )"""
+            )
 
             # Prune
             self._db.execute(

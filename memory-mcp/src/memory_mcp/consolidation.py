@@ -547,9 +547,9 @@ class ConsolidationEngine:
 
         cids_with_centroid = list(centroids.keys())
         overlap_pairs = 0
-        dual_members_added = 0
 
-        db = store._ensure_connected()
+        # バッチ用リスト: (composite_id, member_id, weight)
+        inserts: list[tuple[str, str, float]] = []
 
         for i in range(len(cids_with_centroid)):
             for j in range(i + 1, len(cids_with_centroid)):
@@ -574,13 +574,7 @@ class ConsolidationEngine:
                         np.linalg.norm(mvec) * np.linalg.norm(centroid_b) + 1e-10
                     ))
                     if msim > overlap_threshold:
-                        db.execute(
-                            """INSERT OR IGNORE INTO composite_members
-                               (composite_id, member_id, contribution_weight)
-                               VALUES (?, ?, ?)""",
-                            (cid_b, mid, 0.5),
-                        )
-                        dual_members_added += 1
+                        inserts.append((cid_b, mid, 0.5))
 
                 # B のメンバーが A の重心に近いか確認
                 for mid, mvec in member_vecs_map.get(cid_b, []):
@@ -590,15 +584,17 @@ class ConsolidationEngine:
                         np.linalg.norm(mvec) * np.linalg.norm(centroid_a) + 1e-10
                     ))
                     if msim > overlap_threshold:
-                        db.execute(
-                            """INSERT OR IGNORE INTO composite_members
-                               (composite_id, member_id, contribution_weight)
-                               VALUES (?, ?, ?)""",
-                            (cid_a, mid, 0.5),
-                        )
-                        dual_members_added += 1
+                        inserts.append((cid_a, mid, 0.5))
 
-        if dual_members_added > 0:
+        dual_members_added = len(inserts)
+        if inserts:
+            db = store._ensure_connected()
+            db.executemany(
+                """INSERT OR IGNORE INTO composite_members
+                   (composite_id, member_id, contribution_weight)
+                   VALUES (?, ?, ?)""",
+                inserts,
+            )
             db.commit()
 
         return {"overlap_pairs": overlap_pairs, "dual_members_added": dual_members_added}
