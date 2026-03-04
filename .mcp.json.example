@@ -10,14 +10,16 @@
       "env": {
         "TAPO_CAMERA_HOST": "192.168.1.xxx",
         "TAPO_USERNAME": "your-username",
-        "TAPO_PASSWORD": "your-password"
+        "TAPO_PASSWORD": "your-password",
+        "TAPO_LISTEN_URL": "rtsp://localhost:554/your_stream"
       }
     },
     "memory": {
       "command": "uv",
       "args": ["run", "--directory", "memory-mcp", "memory-mcp"],
       "env": {
-        "TOM_DEFAULT_PERSON": "name"
+        "CHIVE_MODEL_PATH": "/path/to/chive-model.bin",
+        "MEMORY_MD_PATH": "/path/to/MEMORY.md"
       }
     },
     "system-temperature": {
@@ -28,12 +30,20 @@
       "command": "uv",
       "args": ["run", "--directory", "tts-mcp", "tts-mcp"],
       "env": {
-        "ELEVENLABS_API_KEY": "your-api-key",
+        "SBV2_API_URL": "http://127.0.0.1:5000",
+        "SBV2_MODEL_ID": "0",
+        "SBV2_STYLE": "Neutral",
+        "SBV2_LANGUAGE": "JP",
+        "TTS_DEFAULT_ENGINE": "sbv2",
         "VOICEVOX_URL": "http://localhost:50021",
         "VOICEVOX_SPEAKER": "3",
         "TTS_PLAYBACK": "auto",
         "GO2RTC_URL": "http://localhost:1984",
-        "GO2RTC_STREAM": "tapo_cam"
+        "GO2RTC_STREAM": "your_stream",
+        "GO2RTC_CONFIG": "/path/to/go2rtc-config.yaml",
+        "TAPO_CAMERA_HOST": "192.168.1.xxx",
+        "TAPO_USERNAME": "your-username",
+        "TAPO_PASSWORD": "your-password"
       }
     },
     "desire-system": {
