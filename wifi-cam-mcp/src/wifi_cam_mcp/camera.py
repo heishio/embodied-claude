@@ -35,6 +35,7 @@ class CaptureResult:
     timestamp: str
     width: int
     height: int
+    position: "CameraPosition | None" = None
 
 
 @dataclass(frozen=True)
@@ -56,6 +57,7 @@ class MoveResult:
     degrees: int
     success: bool
     message: str
+    position: "CameraPosition | None" = None
 
 
 @dataclass
@@ -339,6 +341,7 @@ class TapoCamera:
             timestamp=timestamp,
             width=width,
             height=height,
+            position=self.get_position(),
         )
 
     async def _try_onvif_snapshot(self) -> bytes | None:
@@ -500,11 +503,13 @@ class TapoCamera:
             # Give the motor time to move
             await asyncio.sleep(0.5)
 
+            pos = self.get_position()
             return MoveResult(
                 direction=direction,
                 degrees=degrees,
                 success=True,
-                message=f"Moved {direction.value} by {degrees} degrees",
+                message=f"Moved {direction.value} by {degrees} degrees (position: pan={pos.pan:+.0f}, tilt={pos.tilt:+.0f})",
+                position=pos,
             )
         except Exception as e:
             return MoveResult(
@@ -680,7 +685,10 @@ class TapoCamera:
             # Convert zeep object to a plain dict
             import zeep.helpers
 
-            return zeep.helpers.serialize_object(info, dict)
+            result = zeep.helpers.serialize_object(info, dict)
+            pos = self.get_position()
+            result["Position"] = {"pan": pos.pan, "tilt": pos.tilt}
+            return result
         except Exception as e:
             logger.error("Failed to get device info: %s", e)
             return {"error": str(e)}
