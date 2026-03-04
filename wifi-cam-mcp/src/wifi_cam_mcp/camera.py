@@ -461,17 +461,17 @@ class TapoCamera:
             case Direction.RIGHT:
                 pan_delta = -_degrees_to_normalized_pan(degrees)
             case Direction.UP:
-                # Tapo C210 ONVIF: y+ = physical UP, y- = physical DOWN
+                # Tapo ONVIF: y+ = physical UP, y- = physical DOWN
                 tilt_delta = _degrees_to_normalized_tilt(degrees)
             case Direction.DOWN:
                 tilt_delta = -_degrees_to_normalized_tilt(degrees)
 
         # In ceiling mount mode the camera is upside-down:
-        # - Tilt inverts (y=+1.0 becomes the upper limit)
         # - Pan mirrors (left/right swap)
-        if self._config.mount_mode == "ceiling":
+        # - Tilt is unchanged: swapping base sign + physical inversion cancel out
+        mount_mode = get_behavior("wifi-cam", "mount_mode", self._config.mount_mode)
+        if mount_mode == "ceiling":
             pan_delta = -pan_delta
-            tilt_delta = -tilt_delta
 
         try:
             # Build the RelativeMove request as a dict.
@@ -534,10 +534,11 @@ class TapoCamera:
             status = await self._ptz_service.GetStatus({"ProfileToken": self._profile_token})
             if status.Position and status.Position.PanTilt:
                 pan = status.Position.PanTilt.x
-                # Tapo ONVIF: y+ = physical DOWN (desk mount), flip for user
-                tilt = -status.Position.PanTilt.y
-                if self._config.mount_mode == "ceiling":
-                    # Ceiling: camera upside-down, both axes mirror
+                # Tapo ONVIF: y+ = physical UP
+                tilt = status.Position.PanTilt.y
+                mount_mode = get_behavior("wifi-cam", "mount_mode", self._config.mount_mode)
+                if mount_mode == "ceiling":
+                    # Ceiling: camera upside-down, pan mirrors, tilt inverts
                     pan = -pan
                     tilt = -tilt
                 return CameraPosition(pan=pan, tilt=tilt)
