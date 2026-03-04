@@ -46,7 +46,6 @@ class ServerConfig:
 
     name: str = "memory-mcp"
     version: str = "0.1.0"
-    tom_default_person: str = "コウタ"
 
     @classmethod
     def from_env(cls) -> "ServerConfig":
@@ -54,5 +53,4 @@ class ServerConfig:
         return cls(
             name=os.getenv("MCP_SERVER_NAME", "memory-mcp"),
             version=os.getenv("MCP_SERVER_VERSION", "0.1.0"),
-            tom_default_person=os.getenv("TOM_DEFAULT_PERSON", "コウタ"),
         )

@@ -63,15 +63,17 @@
 
 ### memory-mcp（脳）
 
-| ツール | パラメータ | 説明 |
-|--------|-----------|------|
-| `diary` | content, emotion?, importance?, category?, image_path?, camera_position?, resolution?, audio_path?, transcript?, steps? | 日記エントリ保存（テキスト/画像付き/音声付き統合）。steps を渡すと体験（動詞チェーン）も同時保存 |
-| `update_diary` | memory_id, amendment, emotion?, importance? | 既存日記を取り消し線+追記で更新（元の内容は~~取り消し線~~で残る） |
-| `recall` | context, n_results?, chain_depth? | 文脈想起（chain_depth>=1 で関連記憶も辿る） |
-| `recall_divergent` | context, n_results?, max_branches?, max_depth?, temperature?, include_diagnostics? | 発散的想起 |
-| `list_recent_memories` | limit?, category_filter? | 最近一覧 |
-| `consolidate_memories` | window_hours?, max_replay_events?, link_update_strength? | 手動の再生・統合 |
-| `rebuild_recall_index` | なし | recall_indexを再構築（起動時に自動構築済み、通常は不要） |
+| ツール | 説明 |
+|--------|------|
+| `diary` | 記憶を保存（テキスト/画像/音声統合。steps 付きで動詞チェーンも同時保存） |
+| `update_diary` | 既存記憶を取り消し線+追記で更新 |
+| `recall` | 統合検索（quadrant: literal/analogy/surface、freshness フィルタ） |
+| `recall_divergent` | 連想を発散させた想起 |
+| `recall_experience` | 動詞チェーンを意味検索（quadrant 対応） |
+| `list_recent_memories` | 最近の記憶一覧 |
+| `crystallize` | 感覚バッファを動詞チェーンに変換 |
+| `consolidate_memories` | 記憶の再生・統合（海馬リプレイ風） |
+| `rebuild_recall_index` | recall_index を再構築 |
 
 #### 動詞チェーン（体験記憶）
 
@@ -80,7 +82,6 @@
 | ツール | パラメータ | 説明 |
 |--------|-----------|------|
 | `crystallize` | emotion?, importance?, min_verbs?, clear_buffer?, batch_size?, offset? | 感覚バッファを自動で動詞チェーンに変換。会話中に溜まったキーワードをまとめる |
-| `remember_experience` | steps[], context?, emotion?, importance? | 手動で動詞チェーンを作成。steps は `{verb, nouns[]}` の配列 |
 | `recall_experience` | context, n_results? | 意味的類似度で動詞チェーンを検索（時間減衰・感情・重要度でスコアリング） |
 
 

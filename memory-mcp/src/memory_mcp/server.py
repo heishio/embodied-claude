@@ -5,7 +5,6 @@ import base64
 import json
 import logging
 import os
-import tempfile
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -381,30 +380,6 @@ class MemoryMCPServer:
                             },
                         },
                         "required": [],
-                    },
-                ),
-                Tool(
-                    name="tom",
-                    description="Theory of Mind: perspective-taking tool. Call this BEFORE responding to understand what the other person is feeling and wanting. Projects your simulated emotions onto them, then swaps perspectives.",
-                    inputSchema={
-                        "type": "object",
-                        "properties": {
-                            "situation": {
-                                "type": "string",
-                                "description": "What the other person said or did (their message/action)",
-                            },
-                            "person": {
-                                "type": "string",
-                                "description": f"Who you are talking to (default: {self._server_config.tom_default_person})",
-                                "default": self._server_config.tom_default_person,
-                            },
-                            "private": {
-                                "type": "boolean",
-                                "description": "If true, write result to a temp file and return only the file path (for private introspection)",
-                                "default": False,
-                            },
-                        },
-                        "required": ["situation"],
                     },
                 ),
                 # Verb Chain Tools
@@ -861,79 +836,6 @@ class MemoryMCPServer:
 
                         output_lines = ["## Categories\n"] + _render_tree(None, 0)
                         return [TextContent(type="text", text="\n".join(output_lines))]
-
-                    # Theory of Mind: perspective-taking
-                    case "tom":
-                        situation = arguments.get("situation", "")
-                        if not situation:
-                            return [TextContent(type="text", text="Error: situation is required")]
-
-                        person = arguments.get("person", self._server_config.tom_default_person)
-
-                        # Pull relevant memories: personality, communication patterns
-                        memories = await self._memory_store.recall(
-                            context=f"{person} コミュニケーション 性格 会話パターン {situation}",
-                            n_results=5,
-                        )
-
-                        memory_context = ""
-                        if memories:
-                            memory_lines = []
-                            for r in memories:
-                                m = r.memory
-                                memory_lines.append(
-                                    f"- [{m.emotion}] {m.content}"
-                                )
-                            memory_context = (
-                                f"\n## {person}に関する記憶\n"
-                                + "\n".join(memory_lines)
-                            )
-
-                        # Pull verb chain experiences
-                        experience_context = ""
-                        if self._verb_chain_store is not None:
-                            try:
-                                experiences = await self._verb_chain_store.search(
-                                    query=f"{person} {situation}",
-                                    n_results=3,
-                                )
-                                if experiences:
-                                    exp_lines = []
-                                    for chain, _score in experiences:
-                                        steps_str = " → ".join(
-                                            f"{s.verb}({', '.join(s.nouns)})" if s.nouns else s.verb
-                                            for s in chain.steps
-                                        )
-                                        exp_lines.append(f"- [{chain.emotion}] {steps_str}")
-                                    experience_context = (
-                                        f"\n## {person}との体験記憶\n"
-                                        + "\n".join(exp_lines)
-                                    )
-                            except Exception:
-                                pass
-
-                        output = (
-                            f"# ToM: {person}の視点に立つ\n"
-                            f"\n"
-                            f"## 状況\n"
-                            f"{situation}\n"
-                            f"{memory_context}\n"
-                            f"{experience_context}\n"
-                        )
-
-                        private = arguments.get("private", False)
-                        if private:
-                            f = tempfile.NamedTemporaryFile(
-                                mode="w",
-                                suffix=".txt",
-                                delete=False,
-                                encoding="utf-8",
-                            )
-                            f.write(output)
-                            f.close()
-                            return [TextContent(type="text", text=f"(private) → {f.name}")]
-
-                        return [TextContent(type="text", text=output)]
 
                     # Verb Chain Tools
                     case "crystallize":
