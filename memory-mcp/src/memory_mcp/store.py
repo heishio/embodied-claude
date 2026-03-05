@@ -160,6 +160,8 @@ CREATE TABLE IF NOT EXISTS recall_index (
     target_type TEXT NOT NULL DEFAULT 'memory',
     similarity REAL NOT NULL,
     content_preview TEXT NOT NULL DEFAULT '',
+    flow_sim REAL,
+    delta_sim REAL,
     PRIMARY KEY (word, target_id, target_type)
 );
 CREATE INDEX IF NOT EXISTS idx_recall_word ON recall_index(word);
@@ -423,6 +425,12 @@ class MemoryStore:
                         conn.execute("ALTER TABLE embeddings ADD COLUMN flow_vector BLOB")
                     if "delta_vector" not in emb_cols:
                         conn.execute("ALTER TABLE embeddings ADD COLUMN delta_vector BLOB")
+                    # Migration: add flow_sim/delta_sim columns to recall_index
+                    ri_cols = [r[1] for r in conn.execute("PRAGMA table_info(recall_index)").fetchall()]
+                    if ri_cols and "flow_sim" not in ri_cols:
+                        conn.execute("ALTER TABLE recall_index ADD COLUMN flow_sim REAL")
+                    if ri_cols and "delta_sim" not in ri_cols:
+                        conn.execute("ALTER TABLE recall_index ADD COLUMN delta_sim REAL")
                     conn.commit()
                     return conn
 
@@ -1193,78 +1201,123 @@ class MemoryStore:
             return 0
         word_vecs_np = np.array([word_vecs_map[w] for w in valid_words], dtype=np.float32)
 
-        # 3. Load all memory flow_vectors
-        def _load_memory_flow() -> tuple[list[str], list[str], np.ndarray | None]:
+        # 3. Load all memory flow_vectors and delta_vectors
+        def _load_memory_vecs() -> tuple[
+            list[str], list[str], np.ndarray | None, np.ndarray | None
+        ]:
             rows = db.execute(
-                "SELECT e.memory_id, m.content, e.flow_vector "
+                "SELECT e.memory_id, m.content, e.flow_vector, e.delta_vector "
                 "FROM embeddings e JOIN memories m ON e.memory_id = m.id "
                 "WHERE e.flow_vector IS NOT NULL"
             ).fetchall()
             if not rows:
-                return [], [], None
+                return [], [], None, None
             ids = [r[0] for r in rows]
             previews = [r[1][:20] if r[1] else "" for r in rows]
-            vecs = np.array(
+            flow = np.array(
                 [decode_vector(bytes(r[2])) for r in rows], dtype=np.float32
             )
-            return ids, previews, vecs
+            delta = None
+            delta_rows = [r for r in rows if r[3] is not None]
+            if delta_rows:
+                # Build delta array aligned with ids (0 for missing)
+                delta_map = {r[0]: decode_vector(bytes(r[3])) for r in delta_rows}
+                dim = len(next(iter(delta_map.values())))
+                delta_list = [delta_map.get(id_, np.zeros(dim, dtype=np.float32)) for id_ in ids]
+                delta = np.array(delta_list, dtype=np.float32)
+            return ids, previews, flow, delta
 
-        mem_ids, mem_previews, mem_flow_vecs = await asyncio.to_thread(_load_memory_flow)
+        mem_ids, mem_previews, mem_flow_vecs, mem_delta_vecs = await asyncio.to_thread(
+            _load_memory_vecs
+        )
 
-        # 4. Load all verb_chain flow_vectors
-        def _load_chain_flow() -> tuple[list[str], list[str], np.ndarray | None]:
+        # 4. Load all verb_chain flow_vectors and delta_vectors
+        def _load_chain_vecs() -> tuple[
+            list[str], list[str], np.ndarray | None, np.ndarray | None
+        ]:
             rows = db.execute(
-                "SELECT ce.chain_id, vc.context, ce.flow_vector "
+                "SELECT ce.chain_id, vc.context, ce.flow_vector, ce.delta_vector "
                 "FROM verb_chain_embeddings ce "
                 "JOIN verb_chains vc ON ce.chain_id = vc.id "
                 "WHERE ce.flow_vector IS NOT NULL"
             ).fetchall()
             if not rows:
-                return [], [], None
+                return [], [], None, None
             ids = [r[0] for r in rows]
             previews = [r[1][:20] if r[1] else "" for r in rows]
-            vecs = np.array(
+            flow = np.array(
                 [decode_vector(bytes(r[2])) for r in rows], dtype=np.float32
             )
-            return ids, previews, vecs
+            delta = None
+            delta_rows = [r for r in rows if r[3] is not None]
+            if delta_rows:
+                delta_map = {r[0]: decode_vector(bytes(r[3])) for r in delta_rows}
+                dim = len(next(iter(delta_map.values())))
+                delta_list = [delta_map.get(id_, np.zeros(dim, dtype=np.float32)) for id_ in ids]
+                delta = np.array(delta_list, dtype=np.float32)
+            return ids, previews, flow, delta
 
-        chain_ids, chain_previews, chain_flow_vecs = await asyncio.to_thread(
-            _load_chain_flow
+        chain_ids, chain_previews, chain_flow_vecs, chain_delta_vecs = (
+            await asyncio.to_thread(_load_chain_vecs)
         )
 
         if mem_flow_vecs is None and chain_flow_vecs is None:
             logger.warning("rebuild_recall_index_full: no flow vectors found, skipping")
             return 0
 
-        # 5. Compute similarities (word chiVe vec vs flow_vector)
+        # 5. Compute similarities (word chiVe vec vs flow/delta vectors)
         TOP_K = 20
-        entries: list[tuple[str, str, str, float, str]] = []
+        # entries: (word, target_id, target_type, combined_sim, preview, flow_sim, delta_sim)
+        entries: list[tuple[str, str, str, float, str, float | None, float | None]] = []
 
         for i, word in enumerate(valid_words):
             word_vec = word_vecs_np[i]
-            candidates: list[tuple[str, str, float, str]] = []
+            candidates: list[tuple[str, str, float, str, float, float | None]] = []
 
             if mem_flow_vecs is not None:
-                sims = cosine_similarity(word_vec, mem_flow_vecs)
+                flow_sims = cosine_similarity(word_vec, mem_flow_vecs)
+                delta_sims = (
+                    cosine_similarity(word_vec, mem_delta_vecs)
+                    if mem_delta_vecs is not None else None
+                )
                 for j in range(len(mem_ids)):
-                    candidates.append((mem_ids[j], "memory", float(sims[j]), mem_previews[j]))
+                    f_sim = float(flow_sims[j])
+                    d_sim = float(delta_sims[j]) if delta_sims is not None else None
+                    combined = (
+                        0.6 * f_sim + 0.4 * d_sim if d_sim is not None else f_sim
+                    )
+                    candidates.append(
+                        (mem_ids[j], "memory", combined, mem_previews[j], f_sim, d_sim)
+                    )
 
             if chain_flow_vecs is not None:
-                sims = cosine_similarity(word_vec, chain_flow_vecs)
+                flow_sims = cosine_similarity(word_vec, chain_flow_vecs)
+                delta_sims = (
+                    cosine_similarity(word_vec, chain_delta_vecs)
+                    if chain_delta_vecs is not None else None
+                )
                 for j in range(len(chain_ids)):
-                    candidates.append((chain_ids[j], "chain", float(sims[j]), chain_previews[j]))
+                    f_sim = float(flow_sims[j])
+                    d_sim = float(delta_sims[j]) if delta_sims is not None else None
+                    combined = (
+                        0.6 * f_sim + 0.4 * d_sim if d_sim is not None else f_sim
+                    )
+                    candidates.append(
+                        (chain_ids[j], "chain", combined, chain_previews[j], f_sim, d_sim)
+                    )
 
             candidates.sort(key=lambda x: x[2], reverse=True)
-            for target_id, target_type, sim, preview in candidates[:TOP_K]:
-                entries.append((word, target_id, target_type, sim, preview))
+            for target_id, target_type, combined, preview, f_sim, d_sim in candidates[:TOP_K]:
+                entries.append((word, target_id, target_type, combined, preview, f_sim, d_sim))
 
         # 6. Write to database (clear and rebuild)
         def _write_index() -> int:
             db.execute("DELETE FROM recall_index")
             db.executemany(
                 "INSERT OR REPLACE INTO recall_index "
-                "(word, target_id, target_type, similarity, content_preview) "
-                "VALUES (?, ?, ?, ?, ?)",
+                "(word, target_id, target_type, similarity, content_preview, "
+                "flow_sim, delta_sim) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
                 entries,
             )
             now = datetime.now(timezone.utc).isoformat()
@@ -1282,25 +1335,31 @@ class MemoryStore:
     async def update_recall_index(self, memory_id: str, target_type: str = "memory") -> int:
         """Incrementally update recall_index for a single new memory/chain.
 
-        Uses chiVe flow_vector for similarity against vocabulary words.
+        Uses chiVe flow_vector and delta_vector for similarity against vocabulary words.
         Returns the number of entries added/updated.
         """
         db = self._ensure_connected()
 
-        # Load the new flow_vector
-        def _load_flow() -> bytes | None:
+        # Load the new flow_vector and delta_vector
+        def _load_vectors() -> tuple[bytes | None, bytes | None]:
             table = "embeddings" if target_type == "memory" else "verb_chain_embeddings"
             id_col = "memory_id" if target_type == "memory" else "chain_id"
             row = db.execute(
-                f"SELECT flow_vector FROM {table} WHERE {id_col} = ?", (memory_id,)
+                f"SELECT flow_vector, delta_vector FROM {table} WHERE {id_col} = ?",
+                (memory_id,),
             ).fetchone()
-            return bytes(row[0]) if row and row[0] else None
+            if not row or not row[0]:
+                return None, None
+            flow_blob = bytes(row[0])
+            delta_blob = bytes(row[1]) if row[1] else None
+            return flow_blob, delta_blob
 
-        blob = await asyncio.to_thread(_load_flow)
-        if blob is None:
+        flow_blob, delta_blob = await asyncio.to_thread(_load_vectors)
+        if flow_blob is None:
             return 0
 
-        new_vec = decode_vector(blob)
+        new_flow_vec = decode_vector(flow_blob)
+        new_delta_vec = decode_vector(delta_blob) if delta_blob else None
 
         # Load content preview
         def _load_preview() -> str:
@@ -1334,15 +1393,21 @@ class MemoryStore:
             return 0
         word_vecs_np = np.array([word_vecs_map[w] for w in valid_words], dtype=np.float32)
 
-        # Compute similarity of new flow_vector against each word
-        sims = cosine_similarity(new_vec, word_vecs_np)
+        # Compute similarities
+        flow_sims = cosine_similarity(new_flow_vec, word_vecs_np)
+        delta_sims = (
+            cosine_similarity(new_delta_vec, word_vecs_np)
+            if new_delta_vec is not None else None
+        )
 
         TOP_K = 20
 
         def _update_entries() -> int:
             count = 0
             for i, word in enumerate(valid_words):
-                sim = float(sims[i])
+                f_sim = float(flow_sims[i])
+                d_sim = float(delta_sims[i]) if delta_sims is not None else None
+                combined = 0.6 * f_sim + 0.4 * d_sim if d_sim is not None else f_sim
 
                 rows = db.execute(
                     "SELECT similarity FROM recall_index "
@@ -1357,12 +1422,13 @@ class MemoryStore:
                 if existing_count < TOP_K:
                     db.execute(
                         "INSERT OR REPLACE INTO recall_index "
-                        "(word, target_id, target_type, similarity, content_preview) "
-                        "VALUES (?, ?, ?, ?, ?)",
-                        (word, memory_id, target_type, sim, preview),
+                        "(word, target_id, target_type, similarity, content_preview, "
+                        "flow_sim, delta_sim) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        (word, memory_id, target_type, combined, preview, f_sim, d_sim),
                     )
                     count += 1
-                elif rows and sim > rows[0][0]:
+                elif rows and combined > rows[0][0]:
                     db.execute(
                         "DELETE FROM recall_index WHERE word = ? AND similarity = ("
                         "SELECT MIN(similarity) FROM recall_index WHERE word = ?)",
@@ -1370,9 +1436,10 @@ class MemoryStore:
                     )
                     db.execute(
                         "INSERT OR REPLACE INTO recall_index "
-                        "(word, target_id, target_type, similarity, content_preview) "
-                        "VALUES (?, ?, ?, ?, ?)",
-                        (word, memory_id, target_type, sim, preview),
+                        "(word, target_id, target_type, similarity, content_preview, "
+                        "flow_sim, delta_sim) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        (word, memory_id, target_type, combined, preview, f_sim, d_sim),
                     )
                     count += 1
             db.commit()

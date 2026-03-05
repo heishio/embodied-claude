@@ -138,16 +138,38 @@ try:
         scores = {}       # (type, id) → total_similarity
         previews = {}     # (type, id) → content_preview
         hit_words = {}    # (type, id) → set of words that matched
+        flow_sims = {}    # (type, id) → [flow_sim values]
+        delta_sims = {}   # (type, id) → [delta_sim values]
+
+        # Check if flow_sim/delta_sim columns exist
+        has_fd = False
+        try:
+            conn.execute("SELECT flow_sim, delta_sim FROM recall_index LIMIT 1")
+            has_fd = True
+        except Exception:
+            pass
 
         for word, wtype in query_words:
-            rows = conn.execute(
-                "SELECT target_type, target_id, similarity, content_preview "
-                "FROM recall_index WHERE word = ? "
-                "ORDER BY similarity DESC LIMIT 10",
-                (word,),
-            ).fetchall()
+            if has_fd:
+                rows = conn.execute(
+                    "SELECT target_type, target_id, similarity, content_preview, "
+                    "flow_sim, delta_sim "
+                    "FROM recall_index WHERE word = ? "
+                    "ORDER BY similarity DESC LIMIT 10",
+                    (word,),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT target_type, target_id, similarity, content_preview "
+                    "FROM recall_index WHERE word = ? "
+                    "ORDER BY similarity DESC LIMIT 10",
+                    (word,),
+                ).fetchall()
 
-            for target_type, target_id, similarity, preview in rows:
+            for row in rows:
+                target_type, target_id, similarity, preview = row[0], row[1], row[2], row[3]
+                f_sim = row[4] if has_fd and len(row) > 4 else None
+                d_sim = row[5] if has_fd and len(row) > 5 else None
                 key = (target_type, target_id)
                 scores[key] = scores.get(key, 0.0) + similarity
                 if key not in previews and preview:
@@ -155,6 +177,15 @@ try:
                 if key not in hit_words:
                     hit_words[key] = set()
                 hit_words[key].add(word)
+                # Accumulate flow/delta sims for averaging
+                if f_sim is not None:
+                    if key not in flow_sims:
+                        flow_sims[key] = []
+                    flow_sims[key].append(f_sim)
+                if d_sim is not None:
+                    if key not in delta_sims:
+                        delta_sims[key] = []
+                    delta_sims[key].append(d_sim)
 
         if scores:
             # 複数単語がヒットした記憶にボーナス
@@ -171,12 +202,24 @@ try:
                 if p:
                     samples.append(p[:PREVIEW_LEN])
 
+            # Compute flow/delta averages over top hits
+            fd_tag = ""
+            if flow_sims and delta_sims:
+                top_keys = [k for k, _ in ranked]
+                f_vals = [v for k in top_keys for v in flow_sims.get(k, [])]
+                d_vals = [v for k in top_keys for v in delta_sims.get(k, [])]
+                if f_vals and d_vals:
+                    f_avg = sum(f_vals) / len(f_vals)
+                    d_avg = sum(d_vals) / len(d_vals)
+                    if abs(f_avg - d_avg) > 0.15:
+                        fd_tag = f" f{f_avg:.1f}/d{d_avg:.1f}"
+
             sample_str = " / ".join(samples)
             words_str = ",".join(w for w, _ in query_words)
             if sample_str:
-                print(f"[memory-hint] [{words_str}] ({total}件, 例: {sample_str})")
+                print(f"[memory-hint] [{words_str}] ({total}件, 例: {sample_str}){fd_tag}")
             else:
-                print(f"[memory-hint] [{words_str}] ({total}件)")
+                print(f"[memory-hint] [{words_str}] ({total}件){fd_tag}")
         else:
             # recall_index にヒットなし → LIKE フォールバック
             _like_fallback(conn, nouns, verbs)
