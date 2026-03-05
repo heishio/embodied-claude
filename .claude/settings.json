@@ -20,17 +20,17 @@
         "hooks": [
           {
             "type": "command",
-            "command": ".claude/hooks/run-interoception.cmd",
+            "command": ".claude/hooks/interoception.sh",
             "timeout": 15
           },
           {
             "type": "command",
-            "command": ".claude/hooks/run-keyword-buffer.cmd",
+            "command": ".claude/hooks/run-keyword-buffer.sh",
             "timeout": 15
           },
           {
             "type": "command",
-            "command": ".claude/hooks/run-recall-lite.cmd",
+            "command": ".claude/hooks/run-recall-lite.sh",
             "timeout": 15
           }
         ]
