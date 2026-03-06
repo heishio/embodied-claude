@@ -140,13 +140,12 @@ class ConsolidationEngine:
         # max_group_size を超えたら最も相互類似度が高いサブセットに絞る
         for root, indices in list(groups.items()):
             if len(indices) > max_group_size:
-                # 各ペアの類似度合計でスコアを計算し、上位を残す
-                scores: list[tuple[float, int]] = []
-                for idx in indices:
-                    s = sum(sim_matrix[idx, j] for j in indices if j != idx)
-                    scores.append((s, idx))
-                scores.sort(reverse=True)
-                groups[root] = [idx for _, idx in scores[:max_group_size]]
+                idx_arr = np.array(indices)
+                group_sims = sim_matrix[np.ix_(idx_arr, idx_arr)]
+                np.fill_diagonal(group_sims, 0)
+                scores = np.sum(group_sims, axis=1)
+                top_k = np.argsort(-scores)[:max_group_size]
+                groups[root] = idx_arr[top_k].tolist()
 
         # 4. 既存チェック
         existing = await store.get_existing_composite_members()
@@ -236,16 +235,14 @@ class ConsolidationEngine:
         # 2. 既存バイアスを取得
         existing_biases = await store.fetch_template_biases()
 
-        # テンプレート生成（全composite共通） — 3-tuple: (vec, transient_strength, bias_weight)
-        templates: list[tuple[np.ndarray, float, float, str]] = []  # (vec, transient, bias, chain_id)
-        if graph is not None:
-            raw_templates = await store.fetch_verb_chain_templates()
-            for chain_id, vec, verbs, nouns in raw_templates:
-                raw_strength = await graph.get_path_strength(verbs, nouns)
-                strength = min(raw_strength, max_template_strength)
-                if strength > 0:
-                    bias = existing_biases.get(chain_id, 0.0)
-                    templates.append((vec, strength, bias, chain_id))
+        # テンプレート生成（composite重心ベース） — graph不要
+        templates: list[tuple[np.ndarray, float, float, str]] = []  # (vec, transient, bias, template_id)
+        raw_templates = await store.fetch_composite_templates()
+        for template_id, vec, strength in raw_templates:
+            strength = min(strength, max_template_strength)
+            if strength > 0:
+                bias = existing_biases.get(template_id, 0.0)
+                templates.append((vec, strength, bias, template_id))
 
         await store.clear_boundary_layers()
 
@@ -346,7 +343,7 @@ class ConsolidationEngine:
             distances = 0.3 * axial_dist + 1.0 * perp_dist
 
         d_mean = float(np.mean(distances))
-        return [1 if float(d) > d_mean else 0 for d in distances]
+        return (distances > d_mean).astype(int).tolist()
 
     def _apply_noise(
         self,
@@ -376,11 +373,18 @@ class ConsolidationEngine:
         noised = member_vecs.copy()
         m_norms = member_vecs / (np.linalg.norm(member_vecs, axis=1, keepdims=True) + 1e-10)
 
-        for t_vec, transient_strength, bias_weight, _chain_id in templates:
+        # 正規化: effective_strength合計を上限0.5にスケール
+        total_effective = sum(
+            min(ts + BIAS_APPLY_COEFFICIENT * bw, max_template_strength)
+            for _, ts, bw, _ in templates
+        )
+        scale_factor = min(1.0, 0.5 / total_effective) if total_effective > 0.5 else 1.0
+
+        for t_vec, transient_strength, bias_weight, _template_id in templates:
             effective_strength = min(
                 transient_strength + BIAS_APPLY_COEFFICIENT * bias_weight,
                 max_template_strength,
-            )
+            ) * scale_factor
             alpha = rng.normal(0, 1)
             # Pad template vector to match member dimension if needed
             if len(t_vec) < dim:
@@ -391,8 +395,7 @@ class ConsolidationEngine:
                 t_vec = t_vec[:dim]
             t_norm = t_vec / (np.linalg.norm(t_vec) + 1e-10)
             alignments = m_norms @ t_norm  # shape: (n_members,)
-            for i in range(n_members):
-                noised[i] += effective_strength * alpha * float(alignments[i]) * t_norm * noise_scale
+            noised += (effective_strength * alpha * noise_scale) * alignments[:, np.newaxis] * t_norm
 
         # 正規化
         norms = np.linalg.norm(noised, axis=1, keepdims=True) + 1e-10
@@ -462,26 +465,26 @@ class ConsolidationEngine:
             return 0
 
         # update_countを一括取得
-        chain_ids = [t[3] for t in templates]
-        placeholders = ",".join("?" for _ in chain_ids)
+        template_ids = [t[3] for t in templates]
+        placeholders = ",".join("?" for _ in template_ids)
         count_rows = db.execute(
-            f"SELECT chain_id, update_count FROM template_biases WHERE chain_id IN ({placeholders})",
-            chain_ids,
+            f"SELECT template_id, update_count FROM template_biases WHERE template_id IN ({placeholders})",
+            template_ids,
         ).fetchall()
         count_map: dict[str, int] = {}
         for r in count_rows:
-            cid_val = r["chain_id"] if not isinstance(r, tuple) else r[0]
+            tid_val = r["template_id"] if not isinstance(r, tuple) else r[0]
             cnt = r["update_count"] if not isinstance(r, tuple) else r[1]
-            count_map[cid_val] = int(cnt)
+            count_map[tid_val] = int(cnt)
 
         bias_updates: list[tuple[str, float, int]] = []
-        for _vec, transient_strength, bias_weight, chain_id in templates:
+        for _vec, transient_strength, bias_weight, template_id in templates:
             proportion = transient_strength / sum_strengths
             shift_contribution = proportion * avg_shift
-            old_bias = existing_biases.get(chain_id, 0.0)
+            old_bias = existing_biases.get(template_id, 0.0)
             new_bias = min(BIAS_MAX_CAP, old_bias + BIAS_ACCUMULATION_RATE * shift_contribution)
-            old_count = count_map.get(chain_id, 0)
-            bias_updates.append((chain_id, new_bias, old_count + 1))
+            old_count = count_map.get(template_id, 0)
+            bias_updates.append((template_id, new_bias, old_count + 1))
 
         await store.save_template_biases(bias_updates)
         return len(bias_updates)
@@ -560,40 +563,54 @@ class ConsolidationEngine:
         # バッチ用リスト: (composite_id, member_id, weight)
         inserts: list[tuple[str, str, float]] = []
 
+        if not cids_with_centroid:
+            return {"overlap_pairs": 0, "dual_members_added": 0}
+
+        # 事前正規化で重複ノルム計算を排除
+        centroid_arr = np.array([centroids[c] for c in cids_with_centroid])
+        c_norms = np.linalg.norm(centroid_arr, axis=1, keepdims=True) + 1e-10
+        centroid_normed = centroid_arr / c_norms
+
+        # centroid間の類似度行列を一括計算
+        centroid_sim_matrix = centroid_normed @ centroid_normed.T  # (C, C)
+
+        # メンバーベクトルも事前正規化
+        member_normed_map: dict[str, tuple[list[str], np.ndarray]] = {}
+        for cid in cids_with_centroid:
+            mvecs = member_vecs_map.get(cid, [])
+            if mvecs:
+                mids = [m[0] for m in mvecs]
+                vecs = np.array([m[1] for m in mvecs])
+                norms = np.linalg.norm(vecs, axis=1, keepdims=True) + 1e-10
+                member_normed_map[cid] = (mids, vecs / norms)
+
         for i in range(len(cids_with_centroid)):
             for j in range(i + 1, len(cids_with_centroid)):
-                cid_a = cids_with_centroid[i]
-                cid_b = cids_with_centroid[j]
-                centroid_a = centroids[cid_a]
-                centroid_b = centroids[cid_b]
-
-                sim = float(np.dot(centroid_a, centroid_b) / (
-                    np.linalg.norm(centroid_a) * np.linalg.norm(centroid_b) + 1e-10
-                ))
+                sim = float(centroid_sim_matrix[i, j])
                 if sim <= overlap_threshold:
                     continue
 
                 overlap_pairs += 1
+                cid_a = cids_with_centroid[i]
+                cid_b = cids_with_centroid[j]
 
-                # A のメンバーが B の重心に近いか確認
-                for mid, mvec in member_vecs_map.get(cid_a, []):
-                    if mid in existing_members.get(cid_b, set()):
-                        continue
-                    msim = float(np.dot(mvec, centroid_b) / (
-                        np.linalg.norm(mvec) * np.linalg.norm(centroid_b) + 1e-10
-                    ))
-                    if msim > overlap_threshold:
-                        inserts.append((cid_b, mid, 0.5))
+                # A のメンバーが B の重心に近いか（行列演算）
+                if cid_a in member_normed_map:
+                    mids_a, vecs_a = member_normed_map[cid_a]
+                    sims_a = vecs_a @ centroid_normed[j]  # (M_a,)
+                    existing_b = existing_members.get(cid_b, set())
+                    for k in range(len(mids_a)):
+                        if mids_a[k] not in existing_b and float(sims_a[k]) > overlap_threshold:
+                            inserts.append((cid_b, mids_a[k], 0.5))
 
-                # B のメンバーが A の重心に近いか確認
-                for mid, mvec in member_vecs_map.get(cid_b, []):
-                    if mid in existing_members.get(cid_a, set()):
-                        continue
-                    msim = float(np.dot(mvec, centroid_a) / (
-                        np.linalg.norm(mvec) * np.linalg.norm(centroid_a) + 1e-10
-                    ))
-                    if msim > overlap_threshold:
-                        inserts.append((cid_a, mid, 0.5))
+                # B のメンバーが A の重心に近いか（行列演算）
+                if cid_b in member_normed_map:
+                    mids_b, vecs_b = member_normed_map[cid_b]
+                    sims_b = vecs_b @ centroid_normed[i]  # (M_b,)
+                    existing_a = existing_members.get(cid_a, set())
+                    for k in range(len(mids_b)):
+                        if mids_b[k] not in existing_a and float(sims_b[k]) > overlap_threshold:
+                            inserts.append((cid_a, mids_b[k], 0.5))
 
         dual_members_added = len(inserts)
         if inserts:
@@ -634,29 +651,35 @@ class ConsolidationEngine:
             return {"orphans_found": len(orphans), "orphans_rescued": 0}
 
         db = store._ensure_connected()
-        orphans_rescued = 0
 
-        for mem, vec in orphans:
-            best_cid = None
-            best_sim = -1.0
-            for cid, centroid in centroids.items():
-                sim = float(np.dot(vec, centroid) / (
-                    np.linalg.norm(vec) * np.linalg.norm(centroid) + 1e-10
-                ))
-                if sim > best_sim:
-                    best_sim = sim
-                    best_cid = cid
+        # 行列演算で全orphan × 全centroidの類似度を一括計算
+        cid_list = list(centroids.keys())
+        centroid_arr = np.array([centroids[c] for c in cid_list])
+        c_norms = np.linalg.norm(centroid_arr, axis=1, keepdims=True) + 1e-10
+        centroid_normed = centroid_arr / c_norms
 
-            if best_cid is not None and best_sim >= rescue_threshold:
-                db.execute(
-                    """INSERT OR IGNORE INTO composite_members
-                       (composite_id, member_id, contribution_weight)
-                       VALUES (?, ?, ?)""",
-                    (best_cid, mem.id, 0.3),
-                )
-                orphans_rescued += 1
+        orphan_vecs = np.array([vec for _, vec in orphans])
+        o_norms = np.linalg.norm(orphan_vecs, axis=1, keepdims=True) + 1e-10
+        orphan_normed = orphan_vecs / o_norms
 
-        if orphans_rescued > 0:
+        # (O, C) 類似度行列
+        sim_matrix = orphan_normed @ centroid_normed.T
+        best_indices = np.argmax(sim_matrix, axis=1)  # (O,)
+        best_sims = np.max(sim_matrix, axis=1)  # (O,)
+
+        inserts: list[tuple[str, str, float]] = []
+        for i in range(len(orphans)):
+            if float(best_sims[i]) >= rescue_threshold:
+                inserts.append((cid_list[int(best_indices[i])], orphans[i][0].id, 0.3))
+
+        orphans_rescued = len(inserts)
+        if inserts:
+            db.executemany(
+                """INSERT OR IGNORE INTO composite_members
+                   (composite_id, member_id, contribution_weight)
+                   VALUES (?, ?, ?)""",
+                inserts,
+            )
             db.commit()
 
         return {"orphans_found": len(orphans), "orphans_rescued": orphans_rescued}

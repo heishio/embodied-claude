@@ -189,11 +189,11 @@ CREATE TABLE IF NOT EXISTS meta (
 );
 
 CREATE TABLE IF NOT EXISTS template_biases (
-    chain_id TEXT NOT NULL,
+    template_id TEXT NOT NULL,
     bias_weight REAL NOT NULL DEFAULT 0.0,
     update_count INTEGER NOT NULL DEFAULT 0,
     last_updated TEXT NOT NULL,
-    PRIMARY KEY (chain_id)
+    PRIMARY KEY (template_id)
 );
 
 CREATE TABLE IF NOT EXISTS composite_axes (
@@ -385,15 +385,27 @@ class MemoryStore:
                             PRIMARY KEY (composite_id, member_id, layer_index)
                         )""")
                         conn.execute("CREATE INDEX IF NOT EXISTS idx_boundary_layers_composite ON boundary_layers(composite_id)")
-                    # Migration: create template_biases table if missing
+                    # Migration: create/migrate template_biases table
                     if "template_biases" not in existing_tables:
                         conn.execute("""CREATE TABLE IF NOT EXISTS template_biases (
-                            chain_id TEXT NOT NULL,
+                            template_id TEXT NOT NULL,
                             bias_weight REAL NOT NULL DEFAULT 0.0,
                             update_count INTEGER NOT NULL DEFAULT 0,
                             last_updated TEXT NOT NULL,
-                            PRIMARY KEY (chain_id)
+                            PRIMARY KEY (template_id)
                         )""")
+                    else:
+                        # Migrate chain_id → template_id if old schema
+                        cols = {r[1] for r in conn.execute("PRAGMA table_info(template_biases)").fetchall()}
+                        if "chain_id" in cols and "template_id" not in cols:
+                            conn.execute("DROP TABLE template_biases")
+                            conn.execute("""CREATE TABLE template_biases (
+                                template_id TEXT NOT NULL,
+                                bias_weight REAL NOT NULL DEFAULT 0.0,
+                                update_count INTEGER NOT NULL DEFAULT 0,
+                                last_updated TEXT NOT NULL,
+                                PRIMARY KEY (template_id)
+                            )""")
                     # Migration: create composite_axes table if missing
                     if "composite_axes" not in existing_tables:
                         conn.execute("""CREATE TABLE IF NOT EXISTS composite_axes (
@@ -1266,49 +1278,93 @@ class MemoryStore:
             return 0
 
         # 5. Compute similarities (word chiVe vec vs flow/delta vectors)
+        #    numpy行列演算で一括計算（forループ排除）
         TOP_K = 20
-        # entries: (word, target_id, target_type, combined_sim, preview, flow_sim, delta_sim)
+
+        # ターゲット（memory + chain）を結合
+        all_ids: list[str] = []
+        all_types: list[str] = []
+        all_previews: list[str] = []
+        flow_parts: list[np.ndarray] = []
+        delta_parts: list[np.ndarray | None] = []
+
+        if mem_flow_vecs is not None:
+            all_ids.extend(mem_ids)
+            all_types.extend(["memory"] * len(mem_ids))
+            all_previews.extend(mem_previews)
+            flow_parts.append(mem_flow_vecs)
+            delta_parts.append(mem_delta_vecs)
+
+        if chain_flow_vecs is not None:
+            all_ids.extend(chain_ids)
+            all_types.extend(["chain"] * len(chain_ids))
+            all_previews.extend(chain_previews)
+            flow_parts.append(chain_flow_vecs)
+            delta_parts.append(chain_delta_vecs)
+
+        all_flow = np.concatenate(flow_parts)  # (n_targets, dim)
+        n_targets = all_flow.shape[0]
+
+        # 正規化（ゼロベクトル対策: norm==0 → 1 に置換）
+        def _norm(m: np.ndarray) -> np.ndarray:
+            norms = np.linalg.norm(m, axis=1, keepdims=True)
+            norms = np.where(norms == 0, 1.0, norms)
+            return m / norms
+
+        w_norm = _norm(word_vecs_np)   # (n_words, dim)
+        f_norm = _norm(all_flow)       # (n_targets, dim)
+
+        # 行列積で全単語×全ターゲットの類似度を一括計算
+        flow_sim_mat = w_norm @ f_norm.T  # (n_words, n_targets)
+
+        # delta: ターゲットごとにある/なしが混在しうる
+        has_delta_mask = np.zeros(n_targets, dtype=bool)
+        delta_vecs = np.zeros_like(all_flow)
+        offset = 0
+        for dp, fp in zip(delta_parts, flow_parts):
+            n = fp.shape[0]
+            if dp is not None:
+                delta_vecs[offset:offset + n] = dp
+                has_delta_mask[offset:offset + n] = True
+            offset += n
+
+        if has_delta_mask.any():
+            d_norm = _norm(delta_vecs)
+            delta_sim_mat = w_norm @ d_norm.T  # (n_words, n_targets)
+            combined_mat = np.where(
+                has_delta_mask[np.newaxis, :],
+                0.6 * flow_sim_mat + 0.4 * delta_sim_mat,
+                flow_sim_mat,
+            )
+        else:
+            delta_sim_mat = None
+            combined_mat = flow_sim_mat
+
+        # 各wordのtop-K取得
         entries: list[tuple[str, str, str, float, str, float | None, float | None]] = []
+        k = min(TOP_K, n_targets)
 
-        for i, word in enumerate(valid_words):
-            word_vec = word_vecs_np[i]
-            candidates: list[tuple[str, str, float, str, float, float | None]] = []
+        for i in range(len(valid_words)):
+            row = combined_mat[i]
+            if k < n_targets:
+                top_idx = np.argpartition(row, -k)[-k:]
+                top_idx = top_idx[np.argsort(row[top_idx])][::-1]
+            else:
+                top_idx = np.argsort(row)[::-1]
 
-            if mem_flow_vecs is not None:
-                flow_sims = cosine_similarity(word_vec, mem_flow_vecs)
-                delta_sims = (
-                    cosine_similarity(word_vec, mem_delta_vecs)
-                    if mem_delta_vecs is not None else None
+            word = valid_words[i]
+            for j in top_idx:
+                j = int(j)
+                f_sim = float(flow_sim_mat[i, j])
+                d_sim = (
+                    float(delta_sim_mat[i, j])
+                    if delta_sim_mat is not None and has_delta_mask[j]
+                    else None
                 )
-                for j in range(len(mem_ids)):
-                    f_sim = float(flow_sims[j])
-                    d_sim = float(delta_sims[j]) if delta_sims is not None else None
-                    combined = (
-                        0.6 * f_sim + 0.4 * d_sim if d_sim is not None else f_sim
-                    )
-                    candidates.append(
-                        (mem_ids[j], "memory", combined, mem_previews[j], f_sim, d_sim)
-                    )
-
-            if chain_flow_vecs is not None:
-                flow_sims = cosine_similarity(word_vec, chain_flow_vecs)
-                delta_sims = (
-                    cosine_similarity(word_vec, chain_delta_vecs)
-                    if chain_delta_vecs is not None else None
-                )
-                for j in range(len(chain_ids)):
-                    f_sim = float(flow_sims[j])
-                    d_sim = float(delta_sims[j]) if delta_sims is not None else None
-                    combined = (
-                        0.6 * f_sim + 0.4 * d_sim if d_sim is not None else f_sim
-                    )
-                    candidates.append(
-                        (chain_ids[j], "chain", combined, chain_previews[j], f_sim, d_sim)
-                    )
-
-            candidates.sort(key=lambda x: x[2], reverse=True)
-            for target_id, target_type, combined, preview, f_sim, d_sim in candidates[:TOP_K]:
-                entries.append((word, target_id, target_type, combined, preview, f_sim, d_sim))
+                entries.append((
+                    word, all_ids[j], all_types[j],
+                    float(row[j]), all_previews[j], f_sim, d_sim,
+                ))
 
         # 6. Write to database (clear and rebuild)
         def _write_index() -> int:
@@ -2450,20 +2506,58 @@ class MemoryStore:
             results.append((chain_id, vec, verbs, nouns))
         return results
 
+    # ── Composite Templates ─────────────────────
+
+    async def fetch_composite_templates(
+        self,
+    ) -> list[tuple[str, np.ndarray, float]]:
+        """全compositeの(composite_id, flow重心, strength)を返す。
+
+        strength = member_count / max_count * 0.3
+        """
+        db = self._ensure_connected()
+
+        def _fetch() -> list[tuple[str, bytes | None, int]]:
+            rows = db.execute(
+                """SELECT cm.composite_id,
+                          e.flow_vector,
+                          COUNT(cm.member_id) as member_count
+                   FROM composite_members cm
+                   JOIN embeddings e ON e.memory_id = cm.composite_id
+                   WHERE e.flow_vector IS NOT NULL
+                   GROUP BY cm.composite_id"""
+            ).fetchall()
+            return [
+                (row["composite_id"], bytes(row["flow_vector"]), row["member_count"])
+                for row in rows
+            ]
+
+        raw = await asyncio.to_thread(_fetch)
+        if not raw:
+            return []
+
+        max_count = max(r[2] for r in raw)
+        results: list[tuple[str, np.ndarray, float]] = []
+        for cid, flow_blob, member_count in raw:
+            vec = decode_vector(flow_blob)
+            strength = (member_count / max_count) * 0.3 if max_count > 0 else 0.0
+            results.append((cid, vec, strength))
+        return results
+
     # ── Template Biases ──────────────────────────
 
     async def fetch_template_biases(self) -> dict[str, float]:
-        """全バイアスを {chain_id: bias_weight} で返す。"""
+        """全バイアスを {template_id: bias_weight} で返す。"""
         db = self._ensure_connected()
 
         def _fetch() -> dict[str, float]:
-            rows = db.execute("SELECT chain_id, bias_weight FROM template_biases").fetchall()
-            return {row["chain_id"]: row["bias_weight"] for row in rows}
+            rows = db.execute("SELECT template_id, bias_weight FROM template_biases").fetchall()
+            return {row["template_id"]: row["bias_weight"] for row in rows}
 
         return await asyncio.to_thread(_fetch)
 
     async def save_template_biases(self, biases: list[tuple[str, float, int]]) -> None:
-        """バッチ upsert (chain_id, bias_weight, update_count)。"""
+        """バッチ upsert (template_id, bias_weight, update_count)。"""
         if not biases:
             return
         db = self._ensure_connected()
@@ -2471,13 +2565,13 @@ class MemoryStore:
 
         def _save() -> None:
             db.executemany(
-                """INSERT INTO template_biases (chain_id, bias_weight, update_count, last_updated)
+                """INSERT INTO template_biases (template_id, bias_weight, update_count, last_updated)
                    VALUES (?, ?, ?, ?)
-                   ON CONFLICT(chain_id) DO UPDATE SET
+                   ON CONFLICT(template_id) DO UPDATE SET
                        bias_weight = excluded.bias_weight,
                        update_count = excluded.update_count,
                        last_updated = excluded.last_updated""",
-                [(cid, weight, count, now) for cid, weight, count in biases],
+                [(tid, weight, count, now) for tid, weight, count in biases],
             )
             db.commit()
 
