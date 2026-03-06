@@ -795,8 +795,19 @@ class CameraMCPServer:
                 )
 
 
+def _setup_jurigged() -> None:
+    """Enable jurigged live reload for src/**/*.py."""
+    import jurigged
+    import pathlib
+
+    src_dir = str(pathlib.Path(__file__).resolve().parent)
+    jurigged.watch(src_dir, poll=True)
+    logger.info("jurigged live reload enabled for %s", src_dir)
+
+
 def main() -> None:
     """Entry point for the MCP server."""
+    _setup_jurigged()
     server = CameraMCPServer()
     asyncio.run(server.run())
 

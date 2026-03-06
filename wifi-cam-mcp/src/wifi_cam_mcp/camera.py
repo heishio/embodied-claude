@@ -17,6 +17,77 @@ from .config import CameraConfig
 
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# OSD-based flip detection
+# ---------------------------------------------------------------------------
+# Tapo cameras render OSD text (timestamp + logo) at fixed corners:
+#   Normal:  timestamp = top-left,    logo = bottom-left
+#   Flipped: timestamp = bottom-right, logo = top-right  (upside-down)
+#
+# Strategy: count near-white pixels (>=230) in each corner.  OSD text is
+# rendered as bright white overlay, so the side with text has a higher
+# ratio of very bright pixels.  Skin, clothing, and scene content rarely
+# reach >=230 consistently enough to cause false positives.
+# If both sides have negligible bright pixels (white wall), skip correction.
+
+_FLIP_BRIGHT_THRESHOLD = 230  # luminance cutoff for "OSD-white"
+_FLIP_MIN_RATIO_DIFF = 0.01  # minimum bright-pixel ratio difference to act
+
+
+def _osd_bright_ratio(
+    image: Image.Image, region: tuple[int, int, int, int],
+) -> float:
+    """Return the fraction of pixels >= threshold in a crop region."""
+    import numpy as np
+
+    crop = image.crop(region).convert("L")
+    arr = np.frombuffer(crop.tobytes(), dtype=np.uint8)
+    if arr.size == 0:
+        return 0.0
+    return float(np.count_nonzero(arr >= _FLIP_BRIGHT_THRESHOLD) / arr.size)
+
+
+def _detect_flip_from_osd(image: Image.Image) -> bool:
+    """Return True if the image appears upside-down based on Tapo OSD position.
+
+    Compares the ratio of near-white pixels in the "normal" text corners
+    (left side) vs the "flipped" text corners (right side).  Returns False
+    when confidence is too low (e.g. white wall behind the text).
+    """
+    w, h = image.size
+    # Timestamp region: ~28% width × 4.5% height
+    ts_w, ts_h = int(w * 0.28), int(h * 0.045)
+    # Logo region: ~8% width × 4.5% height
+    logo_w, logo_h = int(w * 0.08), int(h * 0.045)
+
+    # Normal orientation corners (left side)
+    ts_normal = (2, 2, ts_w, ts_h)
+    logo_normal = (2, h - logo_h, logo_w, h - 2)
+
+    # Flipped orientation corners (right side)
+    ts_flipped = (w - ts_w, h - ts_h, w - 2, h - 2)
+    logo_flipped = (w - logo_w, 2, w - 2, logo_h)
+
+    normal_score = max(
+        _osd_bright_ratio(image, ts_normal),
+        _osd_bright_ratio(image, logo_normal),
+    )
+    flipped_score = max(
+        _osd_bright_ratio(image, ts_flipped),
+        _osd_bright_ratio(image, logo_flipped),
+    )
+
+    diff = flipped_score - normal_score
+    logger.debug(
+        "OSD flip check: normal=%.3f flipped=%.3f diff=%.3f (threshold=%.3f)",
+        normal_score, flipped_score, diff, _FLIP_MIN_RATIO_DIFF,
+    )
+
+    if abs(diff) < _FLIP_MIN_RATIO_DIFF:
+        return False  # can't tell — don't correct
+
+    return diff > 0
+
 
 class Direction(str, Enum):
     """Pan/Tilt directions."""
@@ -312,6 +383,12 @@ class TapoCamera:
         # In ceiling mount mode the image is upside-down, so rotate 180°.
         if self._config.mount_mode == "ceiling":
             image = image.rotate(180)
+
+        # Optional OSD-based flip detection (mcpBehavior.toml: osd_flip_detect)
+        if get_behavior("wifi-cam", "osd_flip_detect", False):
+            if _detect_flip_from_osd(image):
+                logger.info("OSD flip detected — rotating image 180°")
+                image = image.rotate(180)
 
         # Resize if needed
         w_limit = max_width or self._config.max_width
@@ -689,6 +766,8 @@ class TapoCamera:
             result = zeep.helpers.serialize_object(info, dict)
             pos = self.get_position()
             result["Position"] = {"pan": pos.pan, "tilt": pos.tilt}
+            mount_mode = get_behavior("wifi-cam", "mount_mode", self._config.mount_mode)
+            result["MountMode"] = mount_mode
             return result
         except Exception as e:
             logger.error("Failed to get device info: %s", e)
