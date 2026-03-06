@@ -409,7 +409,7 @@ class CameraMCPServer:
                 match name:
                     case "see":
                         result = await self._camera.capture_image()
-                        contents: list[TextContent | ImageContent] = [
+                        return [
                             ImageContent(
                                 type="image",
                                 data=result.image_base64,
@@ -417,14 +417,9 @@ class CameraMCPServer:
                             ),
                             TextContent(
                                 type="text",
-                                text=f"Captured image at {result.timestamp} ({result.width}x{result.height})",
+                                text=f"Captured image at {result.timestamp} ({result.width}x{result.height}){self._pos_tag()}",
                             ),
                         ]
-                        recall_hint = ""
-                        contents.append(
-                            TextContent(type="text", text=recall_hint)
-                        )
-                        return contents
 
                     case "look_left":
                         degrees = arguments.get("degrees", 30)

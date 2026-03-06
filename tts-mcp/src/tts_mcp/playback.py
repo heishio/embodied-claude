@@ -19,6 +19,36 @@ from urllib.parse import quote
 _SILENCE_PADDING_SECONDS = 0.3
 
 
+def _adjust_volume_wav(wav_bytes: bytes, volume: float) -> bytes:
+    """WAVデータの音量を調整する（PCMサンプルを直接スケーリング）。"""
+    if volume == 1.0:
+        return wav_bytes
+    try:
+        import struct
+
+        with wave.open(io.BytesIO(wav_bytes), "rb") as r:
+            params = r.getparams()
+            frames = r.readframes(params.nframes)
+
+        if params.sampwidth == 2:  # 16-bit PCM
+            n_samples = len(frames) // 2
+            samples = struct.unpack(f"<{n_samples}h", frames)
+            adjusted = struct.pack(
+                f"<{n_samples}h",
+                *(max(-32768, min(32767, int(s * volume))) for s in samples),
+            )
+        else:
+            return wav_bytes
+
+        buf = io.BytesIO()
+        with wave.open(buf, "wb") as w:
+            w.setparams(params)
+            w.writeframes(adjusted)
+        return buf.getvalue()
+    except Exception:
+        return wav_bytes
+
+
 def _append_silence_to_wav(wav_bytes: bytes, seconds: float) -> bytes:
     """WAVデータの末尾に無音を追加する。"""
     try:
@@ -325,19 +355,21 @@ def play_with_go2rtc(
     go2rtc_url: str,
     go2rtc_stream: str,
     go2rtc_ffmpeg: str,
+    volume: float = 1.0,
 ) -> tuple[bool, str]:
     """Play audio through camera speaker via go2rtc backchannel."""
     try:
         abs_path = os.path.abspath(file_path)
 
-        # WAVファイルなら末尾に無音パディングを追加（バッファリング途切れ対策）
+        # WAVファイルなら音量調整＋末尾に無音パディングを追加
         if abs_path.lower().endswith(".wav"):
             with open(abs_path, "rb") as f:
                 original = f.read()
-            padded = _append_silence_to_wav(original, _SILENCE_PADDING_SECONDS)
-            if padded is not original:
+            processed = _adjust_volume_wav(original, volume)
+            processed = _append_silence_to_wav(processed, _SILENCE_PADDING_SECONDS)
+            if processed is not original:
                 with open(abs_path, "wb") as f:
-                    f.write(padded)
+                    f.write(processed)
 
         # Try backchannel stream first (tapo:// only, bypasses RTSP backchannel)
         bc_stream = f"{go2rtc_stream}_bc"

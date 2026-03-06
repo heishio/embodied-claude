@@ -313,6 +313,7 @@ class TTSMCP:
                         pb.go2rtc_url,
                         pb.go2rtc_stream,
                         pb.go2rtc_ffmpeg,
+                        pb.camera_volume,
                     )
                     camera_status = cam_msg
 

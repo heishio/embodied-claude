@@ -79,3 +79,8 @@ go2rtc-config.yaml
 # Windows shortcuts and root-level scripts
 /*.cmd
 *.lnk
+
+# Rules folder
+/.claude/rules/
+
+# User Hooks

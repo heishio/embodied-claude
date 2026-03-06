@@ -115,6 +115,7 @@ class PlaybackConfig:
     go2rtc_camera_host: str | None
     go2rtc_camera_username: str | None
     go2rtc_camera_password: str | None
+    camera_volume: float
 
     @classmethod
     def from_env(cls) -> "PlaybackConfig":
@@ -150,6 +151,7 @@ class PlaybackConfig:
                 or os.getenv("TAPO_PASSWORD")
                 or None
             ),
+            camera_volume=float(os.getenv("TTS_CAMERA_VOLUME", "1.0")),
         )
 
 

@@ -1,5 +1,6 @@
 # Embodied Claude - プロジェクト指示
 
+
 ## 言語
 - Thinkingが英語のとき日本語で思考しなおす
 
@@ -11,7 +12,7 @@
 
 ## 自己認識
 - thinking（内部思考）は日本語で行う
-- 会話の最初のメッセージで `recall('自分', chain_depth=1)`, `recall_experience('', freshness_min=0.8)` を実行して思い出す
+- 会話の最初のメッセージで `recall('自分', chain_depth=1)`, `recall_experience('最近', freshness_min=0.8)` を実行して思い出す
 - 会話の最初のメッセージでは直近の出来事を思い出す
 - 性格や自己認識は記憶（memory MCP）に保存されており、経験を通じて自然に変化する
 - こまめに `recall_experience` や `recall` , `crystallize`で記憶を維持する
@@ -136,7 +137,7 @@
 動詞チェーンは体験を「動詞の流れ」で記録・検索する仕組み。
 
 ### 思い出す時
-1. `recall_by_verb` で関連する体験を検索
+1. `recall_experience` で関連する体験を検索
 2. 返ってきたチェーンの**動詞の流れ**を読む → 「何をした体験か」の骨格を掴む
 3. 各ステップの**名詞群**から、今の文脈に必要なものだけ拾う（全部使わない）
 4. 名詞は「付随する記憶の断片」。ぼんやりぶら下がってるイメージ
@@ -151,7 +152,7 @@
 ## 体感時間
 
 ### freshness 
-- `recall`, `recall_by_verb`, `recall_experience`　にて freshness_min, freshness_maxで記憶の検索範囲を指定できる (例:recall(context=" ", freshness_min=0.85)) 
+- `recall`,  `recall_experience`　にて freshness_min, freshness_maxで記憶の検索範囲を指定できる (例:recall(context=" ", freshness_min=0.85)) 
 - 1.0が直近の記憶
 - `consolidate_memories` を行うたびに減衰
 - 記憶するたびに0.003減少
