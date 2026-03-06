@@ -113,6 +113,10 @@ flowchart TD
 
 このフォークは Windows（Git Bash）環境でも動作する。
 
+### 謝辞
+
+- [fruitriin](https://github.com/fruitriin) - rebuild_recall_index numpy最適化、chiVe .kv形式対応、ゼロ除算対策統一、recall-lite MEMORY_DB_PATH対応、wifi-cam see position追加、macOS用 .shラッパー、OSDフリップ検出（[heishio/embodied-claude-rem#1](https://github.com/heishio/embodied-claude-rem/pull/1)）
+
 ---
 
 **[English README is here](./README_en.md)**
