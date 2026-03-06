@@ -12,6 +12,7 @@ from pathlib import Path
 
 from PIL import Image
 
+from ._behavior import get_behavior
 from .config import CameraConfig
 
 logger = logging.getLogger(__name__)
