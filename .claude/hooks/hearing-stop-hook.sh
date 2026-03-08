@@ -11,6 +11,7 @@ BUFFER_FILE="/tmp/hearing_buffer.jsonl"
 PID_FILE="/tmp/hearing-daemon.pid"
 OFFSET_FILE="/tmp/hearing_stop_offset"
 TIMING_LOG="/tmp/hearing_timing.log"
+GUARANTEED_COUNTER="/tmp/hearing-guaranteed-counter"
 CONTEXT_FILE="/tmp/hearing_context.json"
 
 # stdinからコンテキストを保存（1回だけ読める）
@@ -27,6 +28,30 @@ COUNTER_FILE="/tmp/hearing-stop-counter"
 WAIT_SECONDS=${HEARING_WAIT_SECONDS:-5}
 RETRY_WAIT=${HEARING_RETRY_WAIT:-3}
 NO_SPEECH_THRESHOLD=${HEARING_NO_SPEECH_THRESHOLD:-0.6}
+
+# mcpBehavior.toml から hearing 設定を読む（uv経由でtomllib使用）
+# MCP_BEHAVIOR_TOML が未設定ならプロジェクトルートから探す
+if [ -z "$MCP_BEHAVIOR_TOML" ]; then
+    _PROJECT_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+    [ -f "$_PROJECT_ROOT/mcpBehavior.toml" ] && MCP_BEHAVIOR_TOML="$_PROJECT_ROOT/mcpBehavior.toml"
+fi
+if [ -n "$MCP_BEHAVIOR_TOML" ] && [ -f "$MCP_BEHAVIOR_TOML" ]; then
+    HEARING_DIR="$(cd "$(dirname "$0")/../.." && pwd)/embodied-claude/hearing"
+    [ ! -d "$HEARING_DIR" ] && HEARING_DIR="$(cd "$(dirname "$0")/../.." && pwd)/hearing"
+    eval "$(uv run --directory "$HEARING_DIR" python3 -c "
+import tomllib
+try:
+    with open('$MCP_BEHAVIOR_TOML', 'rb') as f:
+        h = tomllib.load(f).get('hearing', {})
+    print(f'HEARING_MIN_GUARANTEED={h.get(\"min_guaranteed\", 5)}')
+    print(f'HEARING_GUARANTEED_SLEEP={h.get(\"guaranteed_sleep\", 5)}')
+except Exception:
+    print('HEARING_MIN_GUARANTEED=5')
+    print('HEARING_GUARANTEED_SLEEP=5')
+" 2>/dev/null)"
+fi
+HEARING_MIN_GUARANTEED=${HEARING_MIN_GUARANTEED:-5}
+HEARING_GUARANTEED_SLEEP=${HEARING_GUARANTEED_SLEEP:-5}
 
 # ── デーモン稼働確認 ──────────────────────────────────────────
 DAEMON_RUNNING=false
@@ -207,10 +232,12 @@ def try_read():
     offset = read_offset()
     lines, total = read_buffer_from(offset)
     if not lines:
-        return None, total
+        return None, total, False
     entries = filter_entries(lines)
     if not entries:
-        return None, total
+        return None, total, False
+    # 末尾エントリが発話途中かチェック
+    tail_speaking = entries[-1].get("tail_speech", False)
     # 有効 → LLMフィルタ
     texts = [e["text"] for e in entries]
     filtered = llm_filter(texts)
@@ -218,36 +245,54 @@ def try_read():
         # LLMがハルシネーションと判定 → バッファは切り詰めるが結果なし
         last_line_no = lines[-1][0]
         truncate_buffer(last_line_no + 1)
-        return None, total
+        return None, total, False
     # 有効 → 出力 & バッファ切り詰め
     last_line_no = lines[-1][0]
     truncate_buffer(last_line_no + 1)
     n = len(entries)
     first_ts = fmt_time(entries[0]["ts"])
     last_ts = fmt_time(entries[-1]["ts"])
-    return f"[hearing] chunks={n} span={first_ts}~{last_ts} text={filtered}", total
+    return f"[hearing] chunks={n} span={first_ts}~{last_ts} text={filtered}", total, tail_speaking
 
 # チェーン保証回数: バッファが空でもこの回数まではリトライする
-MIN_GUARANTEED = 2
+MIN_GUARANTEED = int(_read_toml_hearing("min_guaranteed", 5))
 count = int(sys.argv[5]) if len(sys.argv) > 5 else 0
 t_start = time.time()
 
 debug_lines = []
+pending_result = None  # tail_speech で保留中の結果
 # 最大3回リトライ（retry_wait間隔）
 for attempt in range(3):
-    result, total = try_read()
+    result, total, tail_speaking = try_read()
     elapsed = time.time() - t_start
-    debug_lines.append(f"  retry{attempt}: {'HIT' if result else 'empty'} buf_lines={total} +{elapsed:.1f}s")
+    tag = "HIT" if result else "empty"
+    if result and tail_speaking:
+        tag = "HIT+tail"
+    debug_lines.append(f"  retry{attempt}: {tag} buf_lines={total} +{elapsed:.1f}s")
     if result:
-        # デバッグ情報を結果の後ろに付与
+        if tail_speaking and attempt < 2:
+            # 末尾に音声あり → まだ喋ってる途中。保留して次のチャンクを待つ
+            pending_result = result
+            time.sleep(retry_wait)
+            continue
+        # tail_speech なし or 最終リトライ → 確定出力
+        # pending があれば今回の結果に統合済み（truncate_bufferで処理済み）
         debug = " | ".join(debug_lines)
         print(f"{result} [debug: count={count} {debug}]")
         sys.exit(0)
-    # バッファ空でも保証回数以内ならリトライ
-    if count >= MIN_GUARANTEED:
-        debug_lines.append(f"  => skip retry (count={count} >= guaranteed={MIN_GUARANTEED})")
-        break
+    # バッファ空だが保留結果あり → 保留結果を出力
+    if pending_result:
+        debug = " | ".join(debug_lines)
+        print(f"{pending_result} [debug: count={count} {debug} (flushed pending)]")
+        sys.exit(0)
+    # バッファ空 → リトライ（保証判定はbash側で行う）
     time.sleep(retry_wait)
+
+# 保留結果が残っていれば出力
+if pending_result:
+    debug = " | ".join(debug_lines)
+    print(f"{pending_result} [debug: count={count} {debug} (flushed pending)]")
+    sys.exit(0)
 
 # 全リトライ失敗時もデバッグ出力
 debug = " | ".join(debug_lines)
@@ -258,23 +303,30 @@ PYEOF
 
 # ── 判定 ──────────────────────────────────────────────────────
 END_TS=$(python3 -c "import time; print(f'{time.time():.3f}')")
+GCOUNT=$(cat "$GUARANTEED_COUNTER" 2>/dev/null || echo 0)
+MIN_GUARANTEED=${HEARING_MIN_GUARANTEED:-5}
+
 if [ -n "$RESULT" ]; then
     echo $((COUNT + 1)) > "$COUNTER_FILE"
+    # HIT → 保証カウンターリセット（発話があったので）
+    rm -f "$GUARANTEED_COUNTER"
     ELAPSED=$(python3 -c "print(f'{$END_TS - $NOW:.1f}')")
     echo "[$(date +%H:%M:%S)] stop-hook-block elapsed=${ELAPSED}s chain=$((COUNT+1))" >> "$TIMING_LOG"
     ESCAPED=$(echo "$RESULT" | sed 's/"/\\"/g')
-    echo "{\"decision\": \"block\", \"reason\": \"Stop hook feedback:\n${ESCAPED}\nチェイン($((COUNT+1))/${MAX_HEARING_CONTINUES})\"}"
+    echo "{\"decision\": \"block\", \"reason\": \"Stop hook feedback:\n${ESCAPED}\nチェイン($((COUNT+1))/${MAX_HEARING_CONTINUES}) 保証(0/${MIN_GUARANTEED})\"}"
 else
     ELAPSED=$(python3 -c "print(f'{$END_TS - $NOW:.1f}')")
-    # チェーン保証: 保証回数以内なら空でもblockして待機
-    MIN_GUARANTEED=2
-    if [ "$COUNT" -lt "$MIN_GUARANTEED" ]; then
+    # チェーン保証: 連続空回数が保証回数以内なら待機
+    if [ "$GCOUNT" -lt "$MIN_GUARANTEED" ]; then
+        # 保証待機: 次のセグメントが来るまで待つ
+        sleep "$HEARING_GUARANTEED_SLEEP"
         echo $((COUNT + 1)) > "$COUNTER_FILE"
-        echo "[$(date +%H:%M:%S)] stop-hook-wait elapsed=${ELAPSED}s chain=$((COUNT+1)) (guaranteed)" >> "$TIMING_LOG"
-        echo "{\"decision\": \"block\", \"reason\": \"Stop hook feedback:\n[hearing] 聞き取り待機中... ($((COUNT+1))/${MAX_HEARING_CONTINUES})\nまだ聞き取れていないけど、静かに続きを待っています。\"}"
+        echo $((GCOUNT + 1)) > "$GUARANTEED_COUNTER"
+        echo "[$(date +%H:%M:%S)] stop-hook-wait elapsed=${ELAPSED}s chain=$((COUNT+1)) guaranteed=$((GCOUNT+1))/${MIN_GUARANTEED}" >> "$TIMING_LOG"
+        echo "{\"decision\": \"block\", \"reason\": \"Stop hook feedback:\n[hearing] 聞き取り待機中... 保証($((GCOUNT+1))/${MIN_GUARANTEED}) チェイン($((COUNT+1))/${MAX_HEARING_CONTINUES})\"}"
     else
-        echo "[$(date +%H:%M:%S)] stop-hook-pass elapsed=${ELAPSED}s (no speech)" >> "$TIMING_LOG"
-        rm -f "$COUNTER_FILE"
+        echo "[$(date +%H:%M:%S)] stop-hook-pass elapsed=${ELAPSED}s (no speech, guaranteed exhausted)" >> "$TIMING_LOG"
+        rm -f "$COUNTER_FILE" "$GUARANTEED_COUNTER"
         exit 0
     fi
 fi

@@ -226,6 +226,21 @@ def _rms_energy(seg_path: Path) -> float:
         return 0.0
 
 
+def _tail_rms(seg_path: Path, tail_sec: float = 0.5) -> float:
+    """Compute RMS energy of the last tail_sec of a WAV segment."""
+    try:
+        with wave.open(str(seg_path), "rb") as wf:
+            sr = wf.getframerate()
+            n = wf.getnframes()
+            tail_frames = int(sr * tail_sec)
+            wf.setpos(max(0, n - tail_frames))
+            frames = wf.readframes(tail_frames)
+            audio = np.frombuffer(frames, dtype=np.int16).astype(np.float32) / 32768.0
+            return float(np.sqrt(np.mean(audio**2)))
+    except Exception:
+        return 0.0
+
+
 def _process_segment(
     transcriber: object, seg_path: Path, seg_num: int,
     debouncer: Debouncer | None = None,
@@ -263,11 +278,19 @@ def _process_segment(
         )
         return
 
+    # 末尾に音声が残っているか（発話途中の可能性）
+    # セグメント全体はVADを通過済みなので、末尾の閾値はVADより低くてOK
+    tail_rms = _tail_rms(seg_path) if vad_energy_threshold > 0 else 0.0
+    tail_has_speech = tail_rms >= vad_energy_threshold * 0.5
+    logger.debug("Segment %d: tail_rms=%.5f threshold=%.5f tail_speech=%s",
+                 seg_num, tail_rms, vad_energy_threshold * 0.5, tail_has_speech)
+
     entry = {
         "ts": datetime.now().astimezone().isoformat(),
         "text": text,
         "no_speech_prob": round(no_speech_prob, 4),
         "seg": seg_num,
+        "tail_speech": tail_has_speech,
     }
 
     append_to_buffer(entry)
