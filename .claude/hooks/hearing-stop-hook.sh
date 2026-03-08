@@ -116,26 +116,62 @@ def fmt_time(ts):
         return ts.split("T")[1][:8]
     return ts
 
+def _read_toml_hearing(key, default=None):
+    """mcpBehavior.toml の [hearing] から値を読む"""
+    toml_path = Path(os.environ.get("MCP_BEHAVIOR_TOML", ""))
+    if not toml_path.is_file():
+        return default
+    try:
+        import tomllib
+    except ModuleNotFoundError:
+        try:
+            import tomli as tomllib
+        except ModuleNotFoundError:
+            return default
+    try:
+        with open(toml_path, "rb") as f:
+            data = tomllib.load(f)
+        return data.get("hearing", {}).get(key, default)
+    except Exception:
+        return default
+
 def llm_filter(texts):
-    """claude -p でハルシネーション判定。実際の発話だけ返す。"""
+    """claude -p でハルシネーション判定。実際の発話だけ返す。opt-in。"""
     import subprocess as sp
+
+    # opt-in チェック
+    if not _read_toml_hearing("llm_filter", False):
+        return " / ".join(texts)  # フィルタなしでそのまま返す
+
+    timeout = int(_read_toml_hearing("llm_filter_timeout", 20))
     combined = " / ".join(texts)
 
-    # コンテキスト読み込み
+    # コンテキスト読み込み（短く切る。[hearing]やhookメタ情報を除去）
     context_parts = []
     user_prompt = Path("/tmp/hearing_user_prompt.txt")
     context_json = Path("/tmp/hearing_context.json")
     if user_prompt.exists():
         up = user_prompt.read_text().strip()
+        # LLMプロンプトの再帰ネスト除去: 【タスク】マーカーがあれば手前を切る
+        if "【タスク】" in up:
+            up = ""
+        # hook由来のメタ情報を除去
+        lines = [l for l in up.splitlines()
+                 if not l.startswith("[hearing]")
+                 and not l.startswith("Stop hook")
+                 and not l.startswith("チェイン")
+                 and "聞き取り待機中" not in l
+                 and "音声認識フィルタ" not in l]
+        up = "\n".join(lines).strip()[:150]
         if up:
-            context_parts.append(f"直前のユーザー入力: {up[:200]}")
+            context_parts.append(f"ユーザー: {up}")
     if context_json.exists():
         try:
             import json as _j
             ctx = _j.loads(context_json.read_text())
             lam = ctx.get("last_assistant_message", "")
             if lam:
-                context_parts.append(f"直前のClaude応答: {lam[:200]}")
+                context_parts.append(f"Claude: {lam[:150]}")
         except Exception:
             pass
     context_str = "\n".join(context_parts) if context_parts else "(コンテキストなし)"
@@ -156,7 +192,7 @@ def llm_filter(texts):
         env.pop("CLAUDECODE", None)
         r = sp.run(
             ["claude", "-p", "--model", "haiku", prompt],
-            capture_output=True, text=True, timeout=10,
+            capture_output=True, text=True, timeout=timeout,
             env=env,
         )
         out = r.stdout.strip()
