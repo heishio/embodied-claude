@@ -183,28 +183,29 @@ class CameraMCPServer:
                         "required": ["preset_id"],
                     },
                 ),
-                Tool(
-                    name="listen",
-                    description="Listen with your ears (microphone) to hear what's happening around you. Use this when someone asks 'what do you hear?' or when you want to know what sounds are present. Returns transcribed text of what you heard.",
-                    inputSchema={
-                        "type": "object",
-                        "properties": {
-                            "duration": {
-                                "type": "number",
-                                "description": "How long to listen in seconds (default: 5, max: 30)",
-                                "default": 5,
-                                "minimum": 1,
-                                "maximum": 30,
-                            },
-                            "transcribe": {
-                                "type": "boolean",
-                                "description": "If true, transcribe the audio to text using Whisper (default: true)",
-                                "default": True,
-                            },
-                        },
-                        "required": [],
-                    },
-                ),
+                # TODO: listen ツールは hearing MCP に移行予定。混乱防止のため一時的に無効化
+                # Tool(
+                #     name="listen",
+                #     description="Listen with your ears (microphone) to hear what's happening around you. Use this when someone asks 'what do you hear?' or when you want to know what sounds are present. Returns transcribed text of what you heard.",
+                #     inputSchema={
+                #         "type": "object",
+                #         "properties": {
+                #             "duration": {
+                #                 "type": "number",
+                #                 "description": "How long to listen in seconds (default: 5, max: 30)",
+                #                 "default": 5,
+                #                 "minimum": 1,
+                #                 "maximum": 30,
+                #             },
+                #             "transcribe": {
+                #                 "type": "boolean",
+                #                 "description": "If true, transcribe the audio to text using Whisper (default: true)",
+                #                 "default": True,
+                #             },
+                #         },
+                #         "required": [],
+                #     },
+                # ),
             ]
 
             # Add stereo vision tools if right camera is configured
