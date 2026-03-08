@@ -4,11 +4,15 @@ from __future__ import annotations
 
 import time
 
+from ._behavior import get_behavior
+
 # Whisper hallucination blacklist (case-insensitive substring match)
-HALLUCINATION_BLACKLIST = [
+# モデル共通のデフォルト
+_DEFAULT_BLACKLIST = [
     "ご視聴ありがとうございました",
     "ご視聴ありがとうございます",
     "最後までご視聴いただきありがとうございます",
+    "ご視聴いただきありがとうございます",
     "チャンネル登録お願いします",
     "チャンネル登録",
     "次回も",
@@ -24,6 +28,30 @@ HALLUCINATION_BLACKLIST = [
     "subscribe",
     "subtitles by",
 ]
+
+# モデル別の追加ブラックリスト
+_MODEL_BLACKLISTS: dict[str, list[str]] = {
+    "small": [
+        "気持ちいい",
+    ],
+}
+
+
+def _load_blacklist() -> list[str]:
+    """デフォルト + モデル別 + mcpBehavior.toml からブラックリストを構築。"""
+    result = list(_DEFAULT_BLACKLIST)
+
+    # モデル別
+    model = str(get_behavior("hearing", "whisper_model", "small"))
+    result.extend(_MODEL_BLACKLISTS.get(model, []))
+
+    # mcpBehavior.toml の [hearing] hallucination_blacklist
+    extra = get_behavior("hearing", "hallucination_blacklist", [])
+    if isinstance(extra, list):
+        result.extend(str(e) for e in extra)
+
+    return result
+
 
 FILLER_WORDS = frozenset(
     "えー ええと えっと あの その うーん んー ま はい うん ん".split()
@@ -66,8 +94,9 @@ def should_skip(text: str) -> bool:
         return True
 
     # Hallucination blacklist (case-insensitive substring)
+    blacklist = _load_blacklist()
     text_lower = text.lower()
-    for phrase in HALLUCINATION_BLACKLIST:
+    for phrase in blacklist:
         if phrase.lower() in text_lower:
             return True
 

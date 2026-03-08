@@ -18,7 +18,7 @@ PREV=$(cat /tmp/hearing_stop_last_ts 2>/dev/null || echo "$NOW")
 DELTA=$(python3 -c "print(f'{$NOW - $PREV:.1f}')")
 echo "$NOW" > /tmp/hearing_stop_last_ts
 echo "[$(date +%H:%M:%S)] stop-hook-start delta=${DELTA}s count=${COUNT:-?}" >> "$TIMING_LOG"
-MAX_HEARING_CONTINUES=${MAX_HEARING_CONTINUES:-5}
+MAX_HEARING_CONTINUES=${MAX_HEARING_CONTINUES:-20}
 COUNTER_FILE="/tmp/hearing-stop-counter"
 WAIT_SECONDS=${HEARING_WAIT_SECONDS:-5}
 RETRY_WAIT=${HEARING_RETRY_WAIT:-3}
