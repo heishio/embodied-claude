@@ -3,11 +3,71 @@
 from __future__ import annotations
 
 import logging
+import os
 import urllib.parse
 import urllib.request
 from typing import Any
 
 logger = logging.getLogger(__name__)
+
+
+_sudachi_tokenizer: Any = None
+_sudachi_mode: Any = None
+
+
+def _get_sudachi() -> tuple[Any, Any] | None:
+    """Lazily create a sudachipy tokenizer. Returns None if unavailable."""
+    global _sudachi_tokenizer, _sudachi_mode
+    if _sudachi_tokenizer is None:
+        try:
+            from sudachipy import dictionary
+            from sudachipy import tokenizer as _tok
+            _sudachi_tokenizer = dictionary.Dictionary().create()
+            _sudachi_mode = _tok.Tokenizer.SplitMode.C
+        except Exception as exc:
+            logger.warning("sudachipy unavailable, skipping reading conversion: %s", exc)
+            return None
+    return _sudachi_tokenizer, _sudachi_mode
+
+
+def _is_latin_word(s: str) -> bool:
+    """True if every char is ASCII and at least one is a latin letter."""
+    if not s:
+        return False
+    has_alpha = False
+    for c in s:
+        if not c.isascii():
+            return False
+        if c.isalpha():
+            has_alpha = True
+    return has_alpha
+
+
+def _to_reading(text: str) -> str:
+    """Convert *only* latin (English) tokens to katakana via sudachipy.
+
+    The rest of the text (kanji/kana/punctuation/numbers) is kept as-is so
+    SBV2's native Japanese prosody survives. Pure-ASCII alphabetic tokens
+    like "hello", "AI", "GPT" get replaced with their katakana reading.
+    Falls back to the original text when sudachipy is unavailable.
+    """
+    result = _get_sudachi()
+    if result is None:
+        return text
+    tok, mode = result
+    parts: list[str] = []
+    try:
+        for m in tok.tokenize(text, mode):
+            surface = m.surface()
+            if _is_latin_word(surface):
+                reading = m.reading_form()
+                parts.append(reading if reading else surface)
+            else:
+                parts.append(surface)
+    except Exception as exc:
+        logger.warning("sudachipy tokenization failed, using original text: %s", exc)
+        return text
+    return "".join(parts)
 
 
 class SBV2Engine:
@@ -32,6 +92,9 @@ class SBV2Engine:
         self._style_weight = style_weight
         self._length = length
         self._language = language
+        self._use_reading = os.getenv(
+            "SBV2_USE_SUDACHI_READING", "true"
+        ).lower() in {"1", "true", "yes", "on"}
 
     @property
     def engine_name(self) -> str:
@@ -62,6 +125,9 @@ class SBV2Engine:
         Returns:
             Tuple of (wav_bytes, 'wav').
         """
+        language = kwargs.get("language", self._language)
+        if self._use_reading and language == "JP":
+            text = _to_reading(text)
         params: dict[str, Any] = {"text": text}
 
         # Explicit model_id override takes priority over model_name

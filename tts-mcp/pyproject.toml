@@ -6,6 +6,8 @@ requires-python = ">=3.10"
 dependencies = [
     "mcp>=1.0.0",
     "python-dotenv>=1.0.0",
+    "sudachipy>=0.6.10",
+    "sudachidict-core>=20250129",
 ]
 
 [project.optional-dependencies]
