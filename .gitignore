@@ -89,6 +89,9 @@ go2rtc-config.yaml
 # Skills
 .claude/skills/
 
+# Output styles (personal)
+.claude/output-styles/
+
 # Local settings (may contain credentials)
 .claude/settings.local.json
 
