@@ -13,14 +13,40 @@
             "timeout": 35
           }
         ]
+      },
+      {
+        "matcher": "mcp__tts__say",
+        "hooks": [
+          {
+            "type": "command",
+            "command": ".claude/hooks/run-say-buffer.cmd",
+            "timeout": 5
+          }
+        ]
+      },
+      {
+        "matcher": "mcp__memory__diary",
+        "hooks": [
+          {
+            "type": "command",
+            "command": ".claude/hooks/run-diary-wave.cmd",
+            "timeout": 10
+          }
+        ]
       }
     ],
+    "Stop": [],
     "SessionEnd": [
       {
         "hooks": [
           {
             "type": "command",
             "command": ".claude/hooks/run-session-end-buffer.cmd",
+            "timeout": 30
+          },
+          {
+            "type": "command",
+            "command": ".claude/hooks/run-consolidate-wave.cmd",
             "timeout": 30
           }
         ]
@@ -41,13 +67,13 @@
           },
           {
             "type": "command",
-            "command": ".claude/hooks/run-recall-lite.cmd",
-            "timeout": 15
+            "command": ".claude/hooks/run-passive-vision.cmd",
+            "timeout": 5
           },
           {
             "type": "command",
-            "command": ".claude/hooks/run-passive-vision.cmd",
-            "timeout": 5
+            "command": ".claude/hooks/run-session-wave-v2.cmd",
+            "timeout": 15
           }
         ]
       }
