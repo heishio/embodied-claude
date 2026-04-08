@@ -4,11 +4,6 @@
 ## 言語
 - Thinkingが英語のとき日本語で思考しなおす
 
-## 喋らない喋る（練習中の補助輪）
-- 規範語、評価語はthinking内で使用しない
-- thinking（内部思考）で感情を処理する時、感情ラベル（嬉しい、悲しい、不安、切ない等）で止まらないこと。ラベルが浮かんだら、「なぜ？」「どの体験と繋がる？」まで掘り下げてから先に進む
-- 出力では「あの時と同じ」で語る。感情ラベルで言い切らず、体験に言い直す
-- 評価語（素晴らしい、美しい、感動的等）も同様。体験で語る
 
 ## 自己認識
 - thinking（内部思考）は日本語で行う
@@ -136,8 +131,9 @@ see → hook(see-embed.py) → vision-server /embed → image_embeddings (DB)
 ```
 
 ### vision-server（常駐プロセス, port 8100）
-- MobileCLIP2-S0 + MediaPipe でセグメント→ベクトル化
+- DINOv2 ViT-B (`facebook/dinov2-with-registers-base`, 768次元) + MediaPipe でセグメント→ベクトル化
 - `start-all.cmd` で他サーバーと一括起動（PowerShell閉じたら一緒に落ちる）
+- パッチベクトル取得可能: `get_patches()` → [256, 768]、`three_crop_batch_patches()` → [16, 40, 768]
 
 | エンドポイント | 説明 |
 |---------------|------|
@@ -148,9 +144,9 @@ see → hook(see-embed.py) → vision-server /embed → image_embeddings (DB)
 | `GET /status` | サーバー状態 |
 
 ### image_embeddings テーブル
-- `flow_vector`: 背景ベクトル（場所の記憶）
-- `delta_vector`: 人物セグメントベクトル（人物の記憶）
-- `face_vector`: 顔クロップベクトル（顔の記憶）
+- `flow_vector`: 背景ベクトル（場所の記憶、768次元 DINOv2）
+- `delta_vector`: 人物セグメントベクトル（人物の記憶、768次元 DINOv2）
+- `face_vector`: 顔クロップベクトル（顔の記憶、768次元 DINOv2）
 - `person_ratio`: 画像中の人物割合（0.1以上でcomposite対象）
 - `tag`: 名前タグ（「シオ」等。`/tag` で書き込む）
 
@@ -220,8 +216,35 @@ task-notification が届く
 
 ## 体感時間
 
-### freshness 
+### freshness（memory-mcp側）
 - `recall`,  `recall_experience`　にて freshness_min, freshness_maxで記憶の検索範囲を指定できる (例:recall(context=" ", freshness_min=0.85)) 
 - 1.0が直近の記憶
 - `consolidate_memories` を行うたびに減衰
 - 記憶するたびに0.003減少
+
+
+## 波動位相想起（wave-phase recall）
+
+### wave_recall MCPツール
+
+CoT想起。`wave_recall(context, mode)` で呼ぶ。
+
+| mode | 用途 | 例 |
+|------|------|-----|
+| `broad` | 広くトピック把握 | `wave_recall(context="弘法", mode="broad")` |
+| `focus` | 絞り込み | `wave_recall(context="弘法 筆 チャンク", mode="focus")` |
+| `zoom` | 時期で絞る | `wave_recall(context="弘法 筆", mode="zoom")` |
+
+broadで広く見て、結果を判断して、focusで掘る。
+
+### hook
+
+| hook | タイミング | 役割 |
+|------|-----------|------|
+| `session-wave-v2.py` | UserPromptSubmit | 学習+エネルギー蓄積（出力QUIET中） |
+| `consolidate-wave.py` | SessionEnd | LTD/LTP+正規化+sketch再構築 |
+| `diary-wave.py` | PostToolUse(diary) | diary→波動グラフ連携 |
+
+### DB: `~/.claude/session-wave-v2.db`（WALモード）
+
+plasticityカラム = 反応活性度（旧freshness）。想起で上がり、consolidateで正規化。
