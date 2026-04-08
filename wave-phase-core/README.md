@@ -44,8 +44,8 @@ Registered as `wave_recall` tool. Calls `python -m wave_phase_core.cli` via subp
 ## References
 
 - Kuramoto, Y. (1984). *Chemical Oscillations, Waves, and Turbulence*. Springer. — Kuramoto oscillator model
-- Hebb, D.O. (1949). *The Organization of Behavior*. Wiley. — Hebbian learning (LTP)
-- Tononi, G. & Cirelli, C. (2003). Sleep and synaptic homeostasis: a hypothesis. *Brain Research Bulletin*, 62(2), 143-150. — Synaptic homeostasis (consolidate normalization)
+- Xu, B., Shen, H., Cao, Q., Qiu, Y. & Cheng, X. (2019). Graph Wavelet Neural Network. *ICLR 2019*. [arXiv:1904.07785](https://arxiv.org/abs/1904.07785) — Graph wavelet transform for spectral convolution
+- Listopad, A. (2025). Wave-Based Semantic Memory with Resonance-Based Retrieval: A Phase-Aware Alternative to Vector Embedding Stores. [arXiv:2509.09691](https://arxiv.org/abs/2509.09691) — Wave pattern memory with resonance retrieval
 
 ## Relationship to reading_session_v2.py
 
