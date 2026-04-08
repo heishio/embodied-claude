@@ -46,7 +46,7 @@ def _extract_accent(text: str) -> tuple[int, int]:
     if not labels:
         return (0, 0)
     for label in labels:
-        m = re.search(r'\F:(\d+)_(\d+)', label)
+        m = re.search(r'/F:(\d+)_(\d+)', label)
         if m:
             return int(m.group(1)), int(m.group(2))
     return (0, 0)
