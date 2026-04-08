@@ -41,6 +41,12 @@ PYTHONPATH=wave-phase-core/src python -m wave_phase_core.cli --mode=focus "query
 
 Registered as `wave_recall` tool. Calls `python -m wave_phase_core.cli` via subprocess.
 
+## References
+
+- Kuramoto, Y. (1984). *Chemical Oscillations, Waves, and Turbulence*. Springer. — Kuramoto oscillator model
+- Hebb, D.O. (1949). *The Organization of Behavior*. Wiley. — Hebbian learning (LTP)
+- Tononi, G. & Cirelli, C. (2003). Sleep and synaptic homeostasis: a hypothesis. *Brain Research Bulletin*, 62(2), 143-150. — Synaptic homeostasis (consolidate normalization)
+
 ## Relationship to reading_session_v2.py
 
 The experimental lab file (`reading_session_v2.py`) is maintained separately. This package contains only the stable, production-ready subset. Lab changes should be ported intentionally.
