@@ -1,2 +1,2 @@
 @echo off
-python "C:\Users\sep61\ClaudeCode\embodied-claude\.claude\hooks\log-see-response.py"
+python "%~dp0log-see-response.py"
