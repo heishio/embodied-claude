@@ -122,6 +122,7 @@ Kuramoto振動子ベースの位相同期で語の関係性を学習し、波動
 - **wave_recall MCPツール**: broad→focus→zoomの3段階CoT想起
 - **plasticity**: シナプス可塑性ベースの反応活性度（旧freshness）。想起で回復、consolidateで正規化
 - **DB**: `~/.claude/session-wave-v2.db`（WALモード）
+- **hook想起出力**: デフォルトOFF。`session-wave-v2.py` のコメントアウトを外すと、入力ごとに連想記憶の断片がコンテキストに注入される
 
 #### DBマイグレーション・記憶インポート
 
