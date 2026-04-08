@@ -512,11 +512,13 @@ def main():
         exclude = set(f"s:{sid}" for sid in current_sids)
         top = [(s, t, sp, sc) for s, t, sp, sc in top if s not in exclude]
 
-        # Output suppressed (QUIET mode) - learning & energy still active
+        # Recall output (QUIET mode - uncomment to enable prompt injection)
+        # Enables associative recall fragments in Claude's context.
         # if top:
         #     lines = [f"  [{sp}] {t[:50]} ({sc:.1f})" for _, t, sp, sc in top[:3]]
         #     print(f"[session-wave] q={query[:3]}\n" + "\n".join(lines))
 
+    # Memory hint output (uncomment to enable)
     # if pool.get("memory_hint"):
     #     print(pool["memory_hint"])
 
