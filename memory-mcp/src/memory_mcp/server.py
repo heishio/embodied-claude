@@ -699,7 +699,7 @@ class MemoryMCPServer:
                                     break
                             if not wave_python:
                                 wave_python = sys.executable
-                            repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))))
+                            repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
                             wave_core_src = os.path.join(repo_root, "wave-phase-core", "src")
                             child_env = os.environ.copy()
                             child_env["PYTHONPATH"] = wave_core_src + os.pathsep + child_env.get("PYTHONPATH", "")
