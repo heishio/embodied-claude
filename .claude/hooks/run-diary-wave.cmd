@@ -1,2 +1,2 @@
 @echo off
-python "C:\Users\sep61\ClaudeCode\embodied-claude\.claude\hooks\diary-wave.py"
+python "%~dp0diary-wave.py"

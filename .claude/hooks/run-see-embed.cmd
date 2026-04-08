@@ -1,2 +1,2 @@
 @echo off
-python "C:\Users\sep61\ClaudeCode\embodied-claude\.claude\hooks\see-embed.py"
+python "%~dp0see-embed.py"

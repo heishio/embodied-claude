@@ -5,6 +5,7 @@ import base64
 import json
 import logging
 import os
+import sys
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -193,6 +194,26 @@ class MemoryMCPServer:
                     },
                 ),
                 # search_memories: removed (merged into recall)
+                Tool(
+                    name="wave_recall",
+                    description="Wave-based recall with topic extraction. 2-pass wave propagation finds topic region and reconstructs context blocks. Use mode='broad' for wide exploration, 'focus' for tight recall, 'zoom' for temporal narrowing. Chain multiple calls: broad→(think)→focus→(think)→zoom for CoT recall.",
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "context": {
+                                "description": "Query text for recall",
+                                "type": "string",
+                            },
+                            "mode": {
+                                "description": "Recall mode: broad (wide topic), focus (tight), zoom (temporal narrow)",
+                                "type": "string",
+                                "enum": ["broad", "focus", "zoom"],
+                                "default": "broad",
+                            },
+                        },
+                        "required": ["context"],
+                    },
+                ),
                 Tool(
                     name="recall",
                     description="Automatically recall relevant memories based on the current conversation context. Use this to remember things that might be relevant.",
@@ -662,6 +683,49 @@ class MemoryMCPServer:
                         ]
 
                     # search_memories: removed (merged into recall)
+
+                    case "wave_recall":
+                        context = arguments.get("context", "")
+                        if not context:
+                            return [TextContent(type="text", text="Error: context is required")]
+                        mode = arguments.get("mode", "broad")
+                        import asyncio, pathlib
+                        try:
+                            wave_python = os.environ.get("WAVE_PYTHON")
+                            if not wave_python:
+                                # Find system python (not venv) for numpy/scipy/sudachi
+                                for p in sorted(pathlib.Path.home().glob("AppData/Local/Programs/Python/Python3*/python.exe"), reverse=True):
+                                    wave_python = str(p)
+                                    break
+                            if not wave_python:
+                                wave_python = sys.executable
+                            repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))))
+                            wave_core_src = os.path.join(repo_root, "wave-phase-core", "src")
+                            child_env = os.environ.copy()
+                            child_env["PYTHONPATH"] = wave_core_src + os.pathsep + child_env.get("PYTHONPATH", "")
+                            proc = await asyncio.create_subprocess_exec(
+                                wave_python, "-m", "wave_phase_core.cli",
+                                f"--mode={mode}", context,
+                                stdin=asyncio.subprocess.DEVNULL,
+                                stdout=asyncio.subprocess.PIPE,
+                                stderr=asyncio.subprocess.PIPE,
+                                cwd=repo_root,
+                                env=child_env,
+                            )
+                            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
+                            output = stdout.decode("utf-8", errors="replace").strip() if stdout else "No results."
+                            output += f"\n[python: {wave_python}, rc: {proc.returncode}]"
+                            if proc.returncode != 0 and stderr:
+                                output += f"\n[stderr: {stderr.decode('utf-8', errors='replace')[:500]}]"
+                        except asyncio.TimeoutError:
+                            output = "Wave recall timed out."
+                            try:
+                                proc.kill()
+                            except Exception:
+                                pass
+                        except Exception as e:
+                            output = f"Wave recall error: {type(e).__name__}: {e}"
+                        return [TextContent(type="text", text=output)]
 
                     case "recall":
                         context = arguments.get("context", "")

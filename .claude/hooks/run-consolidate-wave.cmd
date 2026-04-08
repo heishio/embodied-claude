@@ -1,2 +1,2 @@
 @echo off
-python "C:\Users\sep61\ClaudeCode\embodied-claude\.claude\hooks\consolidate-wave.py"
+python "%~dp0consolidate-wave.py"

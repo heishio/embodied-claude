@@ -35,10 +35,10 @@ SESSION_DB = os.path.join(HOME, ".claude", "session-wave-v2.db")
 MEMORY_DB = os.path.join(HOME, ".claude", "memories", "memory.db")
 POOL_FILE = os.path.join(HOME, ".claude", "wave-pool.json")
 
-# ── reading_session_v2 imports ──
-sys.path.insert(0, "C:/tmp/wave_phase_lab")
+# ── wave_phase_core imports ──
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', 'wave-phase-core', 'src'))
 try:
-    from reading_session_v2 import (
+    from wave_phase_core import (
         audio_phase_accent, visual_phase, wrap_pi, kuramoto_chain,
         tokenize_sent, FUNC_WORDS, PAIR_WINDOW, ETA, ETA_PAIR,
     )
@@ -51,6 +51,8 @@ POOL_SESSION_MAX = 40
 POOL_LT_MAX = 40
 FRESHNESS_DECAY = 0.15  # exp(-decay * age): age=10 → 0.22, age=20 → 0.05
 ABRUPT_THRESHOLD = 0.005  # pool activation below this → rebuild
+FRESH_THRESHOLD_MAX = 0.5  # old memories need cos > this to respond
+DEGREE_LEAK_RATE = 0.001   # high-degree nodes saturate faster
 TIMEOUT_SEC = 13
 
 # ── Speaker detection ──
@@ -106,7 +108,7 @@ def init_db(conn):
         CREATE TABLE IF NOT EXISTS session_pairs (
             word_a TEXT, word_b TEXT,
             cos_a REAL, cos_v REAL, signed_a REAL, signed_v REAL,
-            count INTEGER DEFAULT 0, avg_freshness REAL DEFAULT 1.0,
+            count INTEGER DEFAULT 0, plasticity REAL DEFAULT 1.0,
             energy REAL DEFAULT 0.0,
             mean_f REAL, var_f REAL,
             PRIMARY KEY (word_a, word_b));
@@ -116,11 +118,11 @@ def init_db(conn):
         CREATE TABLE IF NOT EXISTS session_sentences (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             text TEXT, speaker TEXT, timestamp REAL, lemmas TEXT,
-            freshness REAL DEFAULT 1.0);
+            plasticity REAL DEFAULT 1.0);
         CREATE TABLE IF NOT EXISTS lt_sentences (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             text TEXT, speaker TEXT, timestamp REAL, lemmas TEXT,
-            freshness REAL DEFAULT 0.5);
+            plasticity REAL DEFAULT 0.5);
     """)
     # Add energy column if missing (migration)
     try:
@@ -146,8 +148,8 @@ def load_state(conn):
     for r in conn.execute("SELECT word, aud_phase, vis_phase FROM session_words"):
         aud[r[0]] = r[1]; vis[r[0]] = r[2]
     pairs = {}
-    for r in conn.execute("SELECT word_a,word_b,cos_a,cos_v,signed_a,signed_v,count,avg_freshness,energy,mean_f,var_f FROM session_pairs"):
-        pairs[(r[0], r[1])] = {'cos_a':r[2],'cos_v':r[3],'signed_a':r[4],'signed_v':r[5],'count':r[6],'avg_freshness':r[7] or 1.0,'energy':r[8] or 0.0,'mean_f':r[9],'var_f':r[10]}
+    for r in conn.execute("SELECT word_a,word_b,cos_a,cos_v,signed_a,signed_v,count,plasticity,energy,mean_f,var_f FROM session_pairs"):
+        pairs[(r[0], r[1])] = {'cos_a':r[2],'cos_v':r[3],'signed_a':r[4],'signed_v':r[5],'count':r[6],'plasticity':r[7] or 1.0,'energy':r[8] or 0.0,'mean_f':r[9],'var_f':r[10]}
     chain = {}
     for r in conn.execute("SELECT word_prev, word_next, count FROM session_chain"):
         chain[(r[0], r[1])] = r[2]
@@ -158,8 +160,8 @@ def save_state(conn, aud, vis, pairs, chain):
     for w in aud:
         conn.execute("INSERT OR REPLACE INTO session_words VALUES(?,?,?)", (w, aud[w], vis[w]))
     for (a, b), ps in pairs.items():
-        conn.execute("INSERT OR REPLACE INTO session_pairs(word_a,word_b,cos_a,cos_v,signed_a,signed_v,count,avg_freshness,energy,mean_f,var_f) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-                     (a, b, ps['cos_a'], ps['cos_v'], ps['signed_a'], ps['signed_v'], ps['count'], ps.get('avg_freshness', 1.0), ps.get('energy', 0.0), ps.get('mean_f'), ps.get('var_f')))
+        conn.execute("INSERT OR REPLACE INTO session_pairs(word_a,word_b,cos_a,cos_v,signed_a,signed_v,count,plasticity,energy,mean_f,var_f) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                     (a, b, ps['cos_a'], ps['cos_v'], ps['signed_a'], ps['signed_v'], ps['count'], ps.get('plasticity', 1.0), ps.get('energy', 0.0), ps.get('mean_f'), ps.get('var_f')))
     for (a, b), cnt in chain.items():
         conn.execute("INSERT OR REPLACE INTO session_chain VALUES(?,?,?)", (a, b, cnt))
     conn.commit()
@@ -187,7 +189,7 @@ def learn_sentence(toks, aud, vis, pairs, chain):
             dv = float(wrap_pi(new_v[j] - new_v[i]))
             ca = float(np.cos(da)); cv = float(np.cos(dv))
             if key not in pairs:
-                pairs[key] = {'cos_a':ca,'cos_v':cv,'signed_a':da,'signed_v':dv,'count':0,'avg_freshness':1.0}
+                pairs[key] = {'cos_a':ca,'cos_v':cv,'signed_a':da,'signed_v':dv,'count':0,'plasticity':1.0}
             ps = pairs[key]
             ps['cos_a'] = (1-ETA_PAIR)*ps['cos_a'] + ETA_PAIR*ca
             ps['cos_v'] = (1-ETA_PAIR)*ps['cos_v'] + ETA_PAIR*cv
@@ -209,11 +211,14 @@ def wave_recall_sparse(query_lemmas, aud, vis, pairs, chain, freshness_weight=Tr
     edge_pair_keys = []
     for (a, b), ps in pairs.items():
         if ps['count'] < 1 or a not in idx or b not in idx: continue
-        w = max(0.0, (ps['cos_a'] + ps['cos_v']) / 2)
+        cos_strength = max(0.0, (ps['cos_a'] + ps['cos_v']) / 2)
         ch = chain.get((a, b), 0) + chain.get((b, a), 0)
-        w += ch / 30.0
+        w = cos_strength + ch / 30.0
         if freshness_weight:
-            w *= max(ps.get('avg_freshness', 1.0), 0.01)
+            fresh = max(ps.get('plasticity', 1.0), 0.01)
+            threshold = (1 - fresh) * FRESH_THRESHOLD_MAX
+            if cos_strength < threshold:
+                continue
         # B-plan: temporal edge modulation via sketch
         if temporal_anchor is not None and ps.get('mean_f') is not None:
             spread = max(math.sqrt(ps['var_f']) if ps.get('var_f') else 0.03, 0.03)
@@ -243,12 +248,15 @@ def wave_recall_sparse(query_lemmas, aud, vis, pairs, chain, freshness_weight=Tr
     ei_j = np.array([e[1] for e in edges])
     ei_w = np.array([e[2] for e in edges])
     edge_energy = np.zeros(len(edges))
+    # Degree saturation: high-degree nodes leak activation each step
+    leak = 1.0 / (1 + degree * DEGREE_LEAK_RATE)
     x = u * 0.3; v = np.zeros(N)
     for step in range(15):
         f = -0.3 * (L @ x)
         if step % 5 == 0: f += 0.05 * (u - x)
         v = v * 0.8 - 0.3 * x * 0.1 + f
         x = np.clip(x + v, -1, 3)
+        x *= leak
         edge_energy += np.abs(x[ei_i] * x[ei_j]) * ei_w
     # Accumulate energy into pairs (side-effect for consolidate LTP)
     if accumulate_energy:
@@ -287,7 +295,7 @@ def build_pool(query_lemmas, conn, aud, vis, pairs, chain):
 
     # Score session sentences
     act_map = {w: z for w, z in activated}
-    sess_rows = conn.execute("SELECT id, text, speaker, lemmas, freshness FROM session_sentences ORDER BY id DESC LIMIT 200").fetchall()
+    sess_rows = conn.execute("SELECT id, text, speaker, lemmas, plasticity FROM session_sentences ORDER BY id DESC LIMIT 200").fetchall()
     n_sess = len(sess_rows)
     scored = []
     for i, (sid, text, spk, lemmas_str, fresh) in enumerate(sess_rows):
@@ -349,12 +357,12 @@ def score_pool_sentences(query_lemmas, pool, conn, aud, vis, pairs, chain, accum
     if pool["session_sids"]:
         placeholders = ",".join("?" * len(pool["session_sids"]))
         rows = conn.execute(
-            f"SELECT id, text, speaker, lemmas, freshness FROM session_sentences WHERE id IN ({placeholders})",
+            f"SELECT id, text, speaker, lemmas, plasticity FROM session_sentences WHERE id IN ({placeholders})",
             pool["session_sids"]).fetchall()
         pool_sents.extend([('s', *r) for r in rows])  # tag source
     # Include all LT sentences (freshness decay is the natural filter)
     lt_rows = conn.execute(
-        "SELECT id, text, speaker, lemmas, freshness FROM lt_sentences"
+        "SELECT id, text, speaker, lemmas, plasticity FROM lt_sentences"
     ).fetchall()
     pool_sents.extend([('lt', *r) for r in lt_rows])
     if not pool_sents:
@@ -461,7 +469,7 @@ def main():
                 if len(t['lemma']) >= 2 and t['lemma'] != speaker:
                     all_query_lemmas.append(t['lemma'])
         lemmas_str = ",".join(t['lemma'] for t in toks)
-        conn.execute("INSERT INTO session_sentences(text,speaker,timestamp,lemmas,freshness) VALUES(?,?,?,?,1.0)",
+        conn.execute("INSERT INTO session_sentences(text,speaker,timestamp,lemmas,plasticity) VALUES(?,?,?,?,1.0)",
                      (sent_text, speaker, time.time(), lemmas_str))
         current_sids.append(conn.execute("SELECT last_insert_rowid()").fetchone()[0])
     save_state(conn, aud, vis, pairs, chain)

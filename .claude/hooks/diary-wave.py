@@ -18,9 +18,9 @@ import numpy as np
 HOME = os.path.expanduser("~")
 SESSION_DB = os.path.join(HOME, ".claude", "session-wave-v2.db")
 
-sys.path.insert(0, "C:/tmp/wave_phase_lab")
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', 'wave-phase-core', 'src'))
 try:
-    from reading_session_v2 import (
+    from wave_phase_core import (
         audio_phase_accent, visual_phase, wrap_pi, kuramoto_chain,
         tokenize_sent, FUNC_WORDS, PAIR_WINDOW, ETA, ETA_PAIR,
     )
