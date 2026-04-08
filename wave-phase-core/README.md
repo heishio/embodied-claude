@@ -44,7 +44,7 @@ Registered as `wave_recall` tool. Calls `python -m wave_phase_core.cli` via subp
 ## References
 
 - Kuramoto, Y. (1984). *Chemical Oscillations, Waves, and Turbulence*. Springer. — Kuramoto oscillator model
-- Xu, B., Shen, H., Cao, Q., Qiu, Y. & Cheng, X. (2019). Graph Wavelet Neural Network. *ICLR 2019*. [arXiv:1904.07785](https://arxiv.org/abs/1904.07785) — Graph wavelet transform for spectral convolution
+- Eliasof, M., Mirza, A., Ephrath, Y., Karlsson, L., Bronstein, M. & Treister, E. (2025). Graph Wave Networks. [arXiv:2505.20034](https://arxiv.org/abs/2505.20034) — Message passing as wave propagation on graphs
 - Listopad, A. (2025). Wave-Based Semantic Memory with Resonance-Based Retrieval: A Phase-Aware Alternative to Vector Embedding Stores. [arXiv:2509.09691](https://arxiv.org/abs/2509.09691) — Wave pattern memory with resonance retrieval
 
 ## Relationship to reading_session_v2.py
