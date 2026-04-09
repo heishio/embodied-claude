@@ -41,7 +41,8 @@ try:
     from wave_phase_core import (
         audio_phase_accent, visual_phase, wrap_pi, kuramoto_chain,
         tokenize_sent, FUNC_WORDS, PAIR_WINDOW, ETA, ETA_PAIR,
-        plasticity_log_scale,
+        plasticity_log_scale, ECHO_WEIGHT, ECHO_ENERGY_CAP,
+        load_echo, save_echo,
     )
 except ImportError:
     sys.exit(0)
@@ -55,9 +56,7 @@ ABRUPT_THRESHOLD = 0.005  # pool activation below this → rebuild
 FRESH_THRESHOLD_MAX = 0.5  # old memories need cos > this to respond
 DEGREE_LEAK_RATE = 0.001   # high-degree nodes saturate faster
 TIMEOUT_SEC = 13
-ECHO_WEIGHT = 0.3           # echo strength in recharge u
 ECHO_TOPIC_THRESHOLD = 0.1  # cos(echo, current) below this → topic switch → reset echo
-ECHO_ENERGY_CAP = 5.0       # max L2 norm of echo vector
 
 # ── Speaker detection ──
 GO2RTC_SNAPSHOT = "http://localhost:1984/api/frame.jpeg?src=tapo_cam"
@@ -171,29 +170,6 @@ def save_state(conn, aud, vis, pairs, chain):
                      (a, b, ps['cos_a'], ps['cos_v'], ps['signed_a'], ps['signed_v'], ps['count'], ps.get('plasticity', 1.0), ps.get('energy', 0.0), ps.get('mean_f'), ps.get('var_f'), ps.get('mean_id'), ps.get('var_id')))
     for (a, b), cnt in chain.items():
         conn.execute("INSERT OR REPLACE INTO session_chain VALUES(?,?,?)", (a, b, cnt))
-    conn.commit()
-
-
-def load_echo(conn, word_idx):
-    """Load echo state vector from DB."""
-    N = len(word_idx)
-    echo = np.zeros(N)
-    try:
-        for r in conn.execute("SELECT word, activation FROM echo_state"):
-            if r[0] in word_idx:
-                echo[word_idx[r[0]]] = r[1]
-    except Exception:
-        pass
-    return echo
-
-
-def save_echo(conn, echo, all_words):
-    """Save echo state vector to DB (only significant entries)."""
-    conn.execute("DELETE FROM echo_state")
-    # Only iterate non-zero indices (avoid full vocab scan)
-    nz = np.nonzero(np.abs(echo) > 0.001)[0]
-    for i in nz:
-        conn.execute("INSERT INTO echo_state VALUES(?,?)", (all_words[i], float(echo[i])))
     conn.commit()
 
 

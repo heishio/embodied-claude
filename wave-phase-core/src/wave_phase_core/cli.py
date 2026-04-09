@@ -16,7 +16,7 @@ import scipy.sparse as sp
 if sys.platform == "win32":
     sys.stdout.reconfigure(encoding="utf-8")
 
-from .constants import FUNC_WORDS, PAIR_WINDOW
+from .constants import FUNC_WORDS, PAIR_WINDOW, ECHO_WEIGHT, ECHO_ENERGY_CAP, load_echo, save_echo
 from .tokenize import tokenize_sent
 
 HOME = os.path.expanduser("~")
@@ -24,30 +24,6 @@ DB = os.path.join(HOME, ".claude", "session-wave-v2.db")
 FRESH_THRESHOLD_MAX = 0.5
 DEGREE_LEAK_RATE = 0.001
 SENT_WORD_WEIGHT = 0.3
-ECHO_WEIGHT = 0.3
-ECHO_ENERGY_CAP = 5.0
-
-
-def load_echo(conn, word_idx):
-    """Load echo state from DB."""
-    N = len(word_idx)
-    echo = np.zeros(N)
-    try:
-        for r in conn.execute("SELECT word, activation FROM echo_state"):
-            if r[0] in word_idx:
-                echo[word_idx[r[0]]] = r[1]
-    except Exception:
-        pass
-    return echo
-
-
-def save_echo(conn, echo, all_words):
-    """Save echo state to DB."""
-    conn.execute("DELETE FROM echo_state")
-    nz = np.nonzero(np.abs(echo) > 0.001)[0]
-    for i in nz:
-        conn.execute("INSERT INTO echo_state VALUES(?,?)", (all_words[i], float(echo[i])))
-    conn.commit()
 
 
 def load_graph():

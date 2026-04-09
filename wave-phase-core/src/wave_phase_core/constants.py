@@ -20,6 +20,34 @@ def plasticity_log_scale(p: float) -> float:
     return math.log(max(p, LTD_FLOOR) / LTD_FLOOR) / _LOG_RANGE
 
 
+ECHO_WEIGHT = 0.3
+ECHO_ENERGY_CAP = 5.0
+
+
+def load_echo(conn, word_idx):
+    """Load echo state vector from DB."""
+    import numpy as np
+    N = len(word_idx)
+    echo = np.zeros(N)
+    try:
+        for r in conn.execute("SELECT word, activation FROM echo_state"):
+            if r[0] in word_idx:
+                echo[word_idx[r[0]]] = r[1]
+    except Exception:
+        pass
+    return echo
+
+
+def save_echo(conn, echo, all_words):
+    """Save echo state vector to DB (only significant entries)."""
+    import numpy as np
+    conn.execute("DELETE FROM echo_state")
+    nz = np.nonzero(np.abs(echo) > 0.001)[0]
+    for i in nz:
+        conn.execute("INSERT INTO echo_state VALUES(?,?)", (all_words[i], float(echo[i])))
+    conn.commit()
+
+
 FUNC_WORDS = {
     'は', 'が', 'を', 'に', 'の', 'と', 'で', 'も', 'て', 'た', 'し',
     'する', 'いる', 'ある', 'だ', 'れる', 'られる', 'ない', 'この', 'その',
