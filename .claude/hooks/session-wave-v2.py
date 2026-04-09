@@ -55,6 +55,9 @@ ABRUPT_THRESHOLD = 0.005  # pool activation below this → rebuild
 FRESH_THRESHOLD_MAX = 0.5  # old memories need cos > this to respond
 DEGREE_LEAK_RATE = 0.001   # high-degree nodes saturate faster
 TIMEOUT_SEC = 13
+ECHO_WEIGHT = 0.3           # echo strength in recharge u
+ECHO_TOPIC_THRESHOLD = 0.1  # cos(echo, current) below this → topic switch → reset echo
+ECHO_ENERGY_CAP = 5.0       # max L2 norm of echo vector
 
 # ── Speaker detection ──
 GO2RTC_SNAPSHOT = "http://localhost:1984/api/frame.jpeg?src=tapo_cam"
@@ -125,6 +128,8 @@ def init_db(conn):
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             text TEXT, speaker TEXT, timestamp REAL, lemmas TEXT,
             plasticity REAL DEFAULT 0.5);
+        CREATE TABLE IF NOT EXISTS echo_state (
+            word TEXT PRIMARY KEY, activation REAL);
     """)
     # Add energy column if missing (migration)
     try:
@@ -169,6 +174,29 @@ def save_state(conn, aud, vis, pairs, chain):
     conn.commit()
 
 
+def load_echo(conn, word_idx):
+    """Load echo state vector from DB."""
+    N = len(word_idx)
+    echo = np.zeros(N)
+    try:
+        for r in conn.execute("SELECT word, activation FROM echo_state"):
+            if r[0] in word_idx:
+                echo[word_idx[r[0]]] = r[1]
+    except Exception:
+        pass
+    return echo
+
+
+def save_echo(conn, echo, all_words):
+    """Save echo state vector to DB (only significant entries)."""
+    conn.execute("DELETE FROM echo_state")
+    # Only iterate non-zero indices (avoid full vocab scan)
+    nz = np.nonzero(np.abs(echo) > 0.001)[0]
+    for i in nz:
+        conn.execute("INSERT INTO echo_state VALUES(?,?)", (all_words[i], float(echo[i])))
+    conn.commit()
+
+
 # ── Learning ──
 def learn_sentence(toks, aud, vis, pairs, chain):
     lems = [t['lemma'] for t in toks]
@@ -204,7 +232,7 @@ def learn_sentence(toks, aud, vis, pairs, chain):
 
 
 # ── Wave recall (sparse, single query) ──
-def wave_recall_sparse(query_lemmas, aud, vis, pairs, chain, freshness_weight=True, top_k=30, accumulate_energy=False, temporal_anchor=None, temporal_mode='plasticity'):
+def wave_recall_sparse(query_lemmas, aud, vis, pairs, chain, freshness_weight=True, top_k=30, accumulate_energy=False, temporal_anchor=None, temporal_mode='plasticity', echo_u=None):
     all_words = list(aud.keys())
     if not all_words: return []
     N = len(all_words)
@@ -250,6 +278,12 @@ def wave_recall_sparse(query_lemmas, aud, vis, pairs, chain, freshness_weight=Tr
     for q in query_lemmas:
         if q in idx: u[idx[q]] = 1.0
     if u.sum() == 0: return []
+    # Add echo to recharge signal (context persistence)
+    u_total = u.copy()
+    if echo_u is not None and len(echo_u) == N:
+        echo_l2 = np.linalg.norm(echo_u)
+        if echo_l2 > 0.001:
+            u_total = u + np.maximum(echo_u / echo_l2, 0) * ECHO_WEIGHT
     # Vectorized edge arrays for energy accumulation
     ei_i = np.array([e[0] for e in edges])
     ei_j = np.array([e[1] for e in edges])
@@ -257,10 +291,10 @@ def wave_recall_sparse(query_lemmas, aud, vis, pairs, chain, freshness_weight=Tr
     edge_energy = np.zeros(len(edges))
     # Degree saturation: high-degree nodes leak activation each step
     leak = 1.0 / (1 + degree * DEGREE_LEAK_RATE)
-    x = u * 0.3; v = np.zeros(N)
+    x = u_total * 0.3; v = np.zeros(N)
     for step in range(15):
         f = -0.3 * (L @ x)
-        if step % 5 == 0: f += 0.05 * (u - x)
+        if step % 5 == 0: f += 0.05 * (u_total - x)
         v = v * 0.8 - 0.3 * x * 0.1 + f
         x = np.clip(x + v, -1, 3)
         x *= leak
@@ -357,7 +391,7 @@ def build_pool(query_lemmas, conn, aud, vis, pairs, chain):
     return pool
 
 
-def score_pool_sentences(query_lemmas, pool, conn, aud, vis, pairs, chain, accumulate_energy=False):
+def score_pool_sentences(query_lemmas, pool, conn, aud, vis, pairs, chain, accumulate_energy=False, echo_u=None):
     """Step 3: Semantic wave → temporal zoom → re-seed."""
     # Collect pool sentences with freshness (session + LT)
     pool_sents = []
@@ -404,7 +438,8 @@ def score_pool_sentences(query_lemmas, pool, conn, aud, vis, pairs, chain, accum
     all_query = list(set(query_lemmas + pool.get("keywords", [])[:5]))
     activated = wave_recall_sparse(all_query[:8], aud, vis, pairs, chain,
                                    freshness_weight=True, top_k=50,
-                                   accumulate_energy=accumulate_energy)
+                                   accumulate_energy=accumulate_energy,
+                                   echo_u=echo_u)
     if not activated:
         return [], 0.0
     scored = _score_by_activation({w: z for w, z in activated})
@@ -423,7 +458,8 @@ def score_pool_sentences(query_lemmas, pool, conn, aud, vis, pairs, chain, accum
         # B-plan: temporal edge modulation via sketch (re-run wave with anchor)
         activated2 = wave_recall_sparse(all_query[:8], aud, vis, pairs, chain,
                                         freshness_weight=True, top_k=50,
-                                        temporal_anchor=anchor_fresh)
+                                        temporal_anchor=anchor_fresh,
+                                        echo_u=echo_u)
         if activated2:
             scored2 = _score_by_activation({w: z for w, z in activated2})
             if scored2:
@@ -474,7 +510,7 @@ def main():
         learn_sentence(toks, aud, vis, pairs, chain)
         for t in toks:
             if t.get('pos') == '名詞' and t['lemma'] not in FUNC_WORDS:
-                if len(t['lemma']) >= 2 and t['lemma'] != speaker:
+                if len(t['lemma']) >= 1 and t['lemma'] != speaker:
                     all_query_lemmas.append(t['lemma'])
         lemmas_str = ",".join(t['lemma'] for t in toks)
         conn.execute("INSERT INTO session_sentences(text,speaker,timestamp,lemmas,plasticity) VALUES(?,?,?,?,1.0)",
@@ -494,6 +530,11 @@ def main():
         conn.close()
         sys.exit(0)
 
+    # Load echo (context persistence from previous turns)
+    all_words = list(aud.keys())
+    word_idx = {w: i for i, w in enumerate(all_words)}
+    echo = load_echo(conn, word_idx)
+
     # Pool management
     pool = load_pool()
     need_rebuild = False
@@ -504,7 +545,7 @@ def main():
 
     if not need_rebuild:
         # Check abruptness: quick activation test on current pool
-        top, activation = score_pool_sentences(query, pool, conn, aud, vis, pairs, chain)
+        top, activation = score_pool_sentences(query, pool, conn, aud, vis, pairs, chain, echo_u=echo)
         if activation < ABRUPT_THRESHOLD:
             need_rebuild = True
 
@@ -514,7 +555,7 @@ def main():
 
     # Final recall from pool (energy accumulation only here)
     if time.time() - t0 < TIMEOUT_SEC - 2:
-        top, activation = score_pool_sentences(query, pool, conn, aud, vis, pairs, chain, accumulate_energy=True)
+        top, activation = score_pool_sentences(query, pool, conn, aud, vis, pairs, chain, accumulate_energy=True, echo_u=echo)
         save_state(conn, aud, vis, pairs, chain)  # persist accumulated energy
         # Exclude current message
         exclude = set(f"s:{sid}" for sid in current_sids)
@@ -525,6 +566,42 @@ def main():
         # if top:
         #     lines = [f"  [{sp}] {t[:50]} ({sc:.1f})" for _, t, sp, sc in top[:3]]
         #     print(f"[session-wave] q={query[:3]}\n" + "\n".join(lines))
+
+    # Update echo: run a quick wave recall with echo to get current activation
+    if time.time() - t0 < TIMEOUT_SEC - 1:
+        act_with_echo = wave_recall_sparse(query[:4], aud, vis, pairs, chain,
+                                           freshness_weight=True, top_k=50,
+                                           echo_u=echo)
+        # Build current activation vector
+        current_act = np.zeros(len(all_words))
+        for w, z in act_with_echo:
+            if w in word_idx:
+                current_act[word_idx[w]] = z
+        # Also include query words
+        for q in query:
+            if q in word_idx:
+                current_act[word_idx[q]] = 0.5
+
+        # Topic switch detection: cos similarity between echo and current
+        echo_norm = np.linalg.norm(echo)
+        current_norm = np.linalg.norm(current_act)
+        if echo_norm > 0.01 and current_norm > 0.01:
+            cos_sim = float(np.dot(echo, current_act) / (echo_norm * current_norm))
+            if cos_sim < ECHO_TOPIC_THRESHOLD:
+                # Topic switched: reset echo to current
+                echo = current_act.copy()
+            else:
+                # Same topic: accumulate (blend old echo with current)
+                echo = echo * 0.7 + current_act * 0.3
+        else:
+            echo = current_act.copy()
+
+        # Cap echo energy to prevent saturation
+        echo_l2 = np.linalg.norm(echo)
+        if echo_l2 > ECHO_ENERGY_CAP:
+            echo *= ECHO_ENERGY_CAP / echo_l2
+
+        save_echo(conn, echo, all_words)
 
     # Memory hint output (uncomment to enable)
     # if pool.get("memory_hint"):
