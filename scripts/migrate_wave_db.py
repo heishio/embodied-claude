@@ -50,6 +50,7 @@ def migrate(db_path):
             count INTEGER DEFAULT 0, plasticity REAL DEFAULT 1.0,
             energy REAL DEFAULT 0.0,
             mean_f REAL, var_f REAL,
+            mean_id REAL, var_id REAL,
             PRIMARY KEY (word_a, word_b));
         CREATE TABLE IF NOT EXISTS session_chain (
             word_prev TEXT, word_next TEXT, count INTEGER DEFAULT 1,
@@ -72,7 +73,7 @@ def migrate(db_path):
             changes.append(f"{table}: {old_col} -> plasticity")
 
     # 4. Add missing columns
-    for col, default in [("energy", "0.0"), ("mean_f", "NULL"), ("var_f", "NULL")]:
+    for col, default in [("energy", "0.0"), ("mean_f", "NULL"), ("var_f", "NULL"), ("mean_id", "NULL"), ("var_id", "NULL")]:
         if not has_column(conn, "session_pairs", col):
             conn.execute(f"ALTER TABLE session_pairs ADD COLUMN {col} REAL DEFAULT {default}")
             changes.append(f"session_pairs: +{col}")

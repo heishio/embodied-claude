@@ -1,10 +1,14 @@
 # -*- coding: utf-8 -*-
-"""wave_recall CLI - Wave-based recall with topic extraction.
+"""wave_recall CLI - Bipartite (word+sentence) wave recall.
+
+Single wave propagation on a graph containing both word and sentence nodes.
+Word-word edges from pair cos + chain, word-sentence edges from membership.
 
 Usage: python -m wave_phase_core.cli [--mode broad|focus|zoom] "query text"
 """
 import sys
 import os
+import math
 import sqlite3
 import numpy as np
 import scipy.sparse as sp
@@ -19,6 +23,7 @@ HOME = os.path.expanduser("~")
 DB = os.path.join(HOME, ".claude", "session-wave-v2.db")
 FRESH_THRESHOLD_MAX = 0.5
 DEGREE_LEAK_RATE = 0.001
+SENT_WORD_WEIGHT = 0.3
 
 
 def load_graph():
@@ -39,13 +44,40 @@ def load_graph():
     return aud, vis, pairs, chain, sents
 
 
-def wave_propagate(query_lemmas, aud, vis, pairs, chain):
+def bipartite_wave(query_lemmas, aud, vis, pairs, chain, sents,
+                   reach_threshold=0.005):
+    """Single wave on word+sentence bipartite graph."""
+    # Word nodes: 0..W-1
     all_words = list(aud.keys())
-    N = len(all_words)
-    idx = {w: i for i, w in enumerate(all_words)}
+    W = len(all_words)
+    word_idx = {w: i for i, w in enumerate(all_words)}
+
+    # Parse sentences → sentence nodes: W..W+S-1
+    sent_data = []
+    ids = [s[0] for s in sents]
+    if not ids:
+        return [], [], []
+    min_id, max_id = min(ids), max(ids)
+    id_range = max(max_id - min_id, 1)
+    for sid, text, lemmas_str, plast in sents:
+        if not lemmas_str:
+            continue
+        content = [l for l in lemmas_str.split(",")
+                   if l not in FUNC_WORDS and len(l) >= 2 and l in word_idx]
+        if len(content) < 2:
+            continue
+        norm_id = (sid - min_id) / id_range
+        sent_data.append((sid, text, content, norm_id, plast or 0.01))
+
+    S = len(sent_data)
+    N = W + S
+
+    # Build edges
     edges = []
+
+    # Word-word edges
     for (a, b), ps in pairs.items():
-        if ps['count'] < 1 or a not in idx or b not in idx:
+        if ps['count'] < 1 or a not in word_idx or b not in word_idx:
             continue
         cos_s = max(0.0, (ps['cos_a'] + ps['cos_v']) / 2)
         ch = chain.get((a, b), 0) + chain.get((b, a), 0)
@@ -55,9 +87,20 @@ def wave_propagate(query_lemmas, aud, vis, pairs, chain):
         if cos_s < thr:
             continue
         if w > 0.001:
-            edges.append((idx[a], idx[b], w))
+            edges.append((word_idx[a], word_idx[b], w))
+
+    # Sentence-word edges
+    for si, (sid, text, content, norm_id, plast) in enumerate(sent_data):
+        sent_node = W + si
+        n_c = len(content)
+        w = SENT_WORD_WEIGHT / max(math.sqrt(n_c), 1)
+        for word in content:
+            edges.append((sent_node, word_idx[word], w))
+
     if not edges:
-        return {}
+        return [], [], []
+
+    # Sparse Laplacian
     degree = np.zeros(N)
     for i, j, w in edges:
         degree[i] += w; degree[j] += w
@@ -70,12 +113,16 @@ def wave_propagate(query_lemmas, aud, vis, pairs, chain):
     A = sp.csr_matrix((vs, (rs, cs)), shape=(N, N))
     dA = np.asarray(A.sum(axis=1)).flatten()
     L = sp.diags(dA) - A
+
+    # Initial energy on query words
     u = np.zeros(N)
     for q in query_lemmas:
-        if q in idx:
-            u[idx[q]] = 1.0
+        if q in word_idx:
+            u[word_idx[q]] = 1.0
     if u.sum() == 0:
-        return {}
+        return [], [], []
+
+    # Wave propagation
     leak = 1.0 / (1 + degree * DEGREE_LEAK_RATE)
     x = u * 0.3
     v = np.zeros(N)
@@ -86,8 +133,23 @@ def wave_propagate(query_lemmas, aud, vis, pairs, chain):
         v = v * 0.8 - 0.3 * x * 0.1 + f
         x = np.clip(x + v, -1, 3)
         x *= leak
-    inv = {v: k for k, v in idx.items()}
-    return {inv[i]: float(x[i]) for i in range(N)}
+
+    # Word activations (for center/chain output)
+    word_act = {}
+    for i in range(W):
+        if x[i] > 0.001:
+            word_act[all_words[i]] = float(x[i])
+
+    # Sentence activations
+    sent_scored = []
+    for si in range(S):
+        act = float(x[W + si])
+        if act > reach_threshold:
+            sid, text, content, norm_id, plast = sent_data[si]
+            sent_scored.append((sid, text, act, norm_id, si))
+    sent_scored.sort(key=lambda r: -r[2])
+
+    return word_act, sent_scored, sent_data
 
 
 def recall(query_text, mode="broad"):
@@ -101,90 +163,75 @@ def recall(query_text, mode="broad"):
     if not query_lemmas:
         query_lemmas = [t['lemma'] for t in toks][:3]
 
-    reach = {"broad": 0.005, "focus": 0.015, "zoom": 0.008}.get(mode, 0.008)
+    reach = {"broad": 0.0005, "focus": 0.0015, "zoom": 0.0008}.get(mode, 0.0008)
 
-    act1 = wave_propagate(query_lemmas, aud, vis, pairs, chain)
-    if not act1:
+    word_act, sent_scored, sent_data = bipartite_wave(
+        query_lemmas, aud, vis, pairs, chain, sents, reach_threshold=reach)
+
+    if not word_act:
         return "No activation from query."
 
+    # Center words
     center = sorted(
-        [(w, z) for w, z in act1.items() if w not in FUNC_WORDS and w not in set(query_lemmas) and z > 0.005],
+        [(w, z) for w, z in word_act.items()
+         if w not in FUNC_WORDS and w not in set(query_lemmas) and z > 0.003],
         key=lambda r: -r[1]
     )[:5]
     center_words = [w for w, _ in center]
 
-    requery = list(set(query_lemmas + center_words))[:8]
-    act2 = wave_propagate(requery, aud, vis, pairs, chain)
-    if not act2:
-        return "No activation from re-query."
-
-    in_topic = {w for w, z in act2.items() if z > reach and w not in FUNC_WORDS}
-
-    scored_sents = []
-    for idx_s, (sid, text, lemmas_str, plast) in enumerate(sents):
-        if not lemmas_str:
-            continue
-        lems = lemmas_str.split(",")
-        content = [l for l in lems if l not in FUNC_WORDS and len(l) >= 2]
-        if not content:
-            continue
-        overlap = sum(1 for l in content if l in in_topic)
-        if overlap < 2:
-            continue
-        wave_score = sum(act2.get(l, 0) for l in content) / len(content)
-        scored_sents.append((sid, text, wave_score, overlap / len(content), plast or 0.01, idx_s))
-
-    scored_sents.sort(key=lambda r: -(r[2] * r[3]))
-
-    content_topic = {w for w in in_topic if len(w) >= 2}
+    # Chain sequences from activated words
+    content_topic = {w for w, z in word_act.items() if z > 0.003 and len(w) >= 2}
     fwd = {}
     for (p, n), c in chain.items():
         if p in content_topic and n in content_topic and c >= 2:
             if p not in fwd or c > chain.get((p, fwd[p]), 0):
                 fwd[p] = n
     all_nexts = set(fwd.values())
-    starts = sorted([w for w in fwd if w not in all_nexts], key=lambda w: -act2.get(w, 0))[:3]
+    starts = sorted([w for w in fwd if w not in all_nexts],
+                    key=lambda w: -word_act.get(w, 0))[:3]
     if not starts and fwd:
-        starts = sorted(fwd.keys(), key=lambda w: -act2.get(w, 0))[:3]
-    used = set()
+        starts = sorted(fwd.keys(), key=lambda w: -word_act.get(w, 0))[:3]
+    used_chain = set()
     sequences = []
     for start in starts:
         seq = [start]
-        used.add(start)
+        used_chain.add(start)
         cur = start
-        while cur in fwd and fwd[cur] not in used:
+        while cur in fwd and fwd[cur] not in used_chain:
             cur = fwd[cur]
             seq.append(cur)
-            used.add(cur)
+            used_chain.add(cur)
         if len(seq) >= 2:
             sequences.append(seq)
 
+    # Block reconstruction from top sentence hits
     NEIGHBOR = 4
     blocks = []
     used_indices = set()
-    for sid, text, ws, ov, pl, idx_s in scored_sents[:3]:
-        if idx_s in used_indices:
+    activated_sids = {sid for sid, _, _, _, _ in sent_scored[:5]}
+
+    for sid, text, act, norm_id, si in sent_scored[:3]:
+        if si in used_indices:
             continue
         block_indices = []
         for offset in range(-NEIGHBOR, NEIGHBOR + 1):
-            ni = idx_s + offset
-            if 0 <= ni < len(sents) and ni not in used_indices:
+            ni = si + offset
+            if 0 <= ni < len(sent_data) and ni not in used_indices:
                 block_indices.append(ni)
                 used_indices.add(ni)
         block_lines = []
         for ni in sorted(block_indices):
-            _, btxt, blems, bpl = sents[ni]
-            if not blems:
-                continue
-            bcontent = [l for l in blems.split(",") if l not in FUNC_WORDS]
-            topic_hit = any(l in in_topic for l in bcontent)
-            if topic_hit or ni == idx_s:
+            _, btxt, bcontent, _, _ = sent_data[ni]
+            # Include if any content word is activated, or if it's the hit itself
+            topic_hit = any(word_act.get(l, 0) > 0.002 for l in bcontent)
+            if topic_hit or ni == si:
                 block_lines.append(btxt)
         if block_lines:
             blocks.append(block_lines)
 
+    # Format output
     lines = []
-    lines.append(f"[wave-recall] q={query_lemmas[:4]} center={center_words[:4]} topic={len(in_topic)}words")
+    lines.append(f"[wave-recall] q={query_lemmas[:4]} center={center_words[:4]} sents={len(sent_scored)}")
     if sequences:
         for seq in sequences[:3]:
             lines.append(f"  chain: {'→'.join(seq)}")

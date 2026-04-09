@@ -51,6 +51,7 @@ def init_db(conn):
             count INTEGER DEFAULT 0, plasticity REAL DEFAULT 1.0,
             energy REAL DEFAULT 0.0,
             mean_f REAL, var_f REAL,
+            mean_id REAL, var_id REAL,
             PRIMARY KEY (word_a, word_b));
         CREATE TABLE IF NOT EXISTS session_chain (
             word_prev TEXT, word_next TEXT, count INTEGER DEFAULT 1,
@@ -81,7 +82,7 @@ def init_db(conn):
         except Exception:
             pass
     # Add temporal sketch columns if missing
-    for col in ("mean_f", "var_f"):
+    for col in ("mean_f", "var_f", "mean_id", "var_id"):
         try:
             conn.execute(f"SELECT {col} FROM session_pairs LIMIT 1")
         except Exception:
@@ -179,18 +180,55 @@ def main():
                 key = tuple(sorted([content[i], content[j]]))
                 if key in pair_set:
                     pair_freshness[key].append(plasticity_log_scale(fresh))
+    # 5b. Rebuild ID-based temporal sketch (mean_id, var_id per pair)
+    lt_all_with_id = conn.execute("SELECT id, lemmas FROM lt_sentences").fetchall()
+    all_ids = [r[0] for r in lt_all_with_id if r[1]]
+    min_id = min(all_ids) if all_ids else 0
+    max_id = max(all_ids) if all_ids else 1
+    id_range = max(max_id - min_id, 1)
+    pair_id_ts = defaultdict(list)
+    for sid, lemmas_str in lt_all_with_id:
+        if not lemmas_str:
+            continue
+        t = (sid - min_id) / id_range  # [0, 1]
+        lems = lemmas_str.split(",")
+        content = [l for l in lems if l not in FUNC_WORDS]
+        n = len(content)
+        for i in range(n):
+            for j in range(i + 1, min(n, i + PAIR_WINDOW)):
+                key = tuple(sorted([content[i], content[j]]))
+                if key in pair_set:
+                    pair_id_ts[key].append(t)
+
     # Clear stale sketches first, then write fresh ones
-    conn.execute("UPDATE session_pairs SET mean_f=NULL, var_f=NULL")
+    conn.execute("UPDATE session_pairs SET mean_f=NULL, var_f=NULL, mean_id=NULL, var_id=NULL")
     sketch_count = 0
     for key, fs in pair_freshness.items():
         a = np.array(fs)
         mean_f = float(a.mean())
         var_f = float(a.var()) if len(a) > 1 else 0.01
+        # ID sketch for same pair
+        id_ts = pair_id_ts.get(key)
+        if id_ts:
+            b = np.array(id_ts)
+            mean_id = float(b.mean())
+            var_id = float(b.var()) if len(b) > 1 else 0.01
+        else:
+            mean_id = None
+            var_id = None
         conn.execute(
-            "UPDATE session_pairs SET mean_f=?, var_f=? WHERE word_a=? AND word_b=?",
-            (mean_f, var_f, key[0], key[1])
+            "UPDATE session_pairs SET mean_f=?, var_f=?, mean_id=?, var_id=? WHERE word_a=? AND word_b=?",
+            (mean_f, var_f, mean_id, var_id, key[0], key[1])
         )
         sketch_count += 1
+    # Write ID sketch for pairs that only have ID data (no plasticity sketch)
+    for key, ts in pair_id_ts.items():
+        if key not in pair_freshness:
+            b = np.array(ts)
+            conn.execute(
+                "UPDATE session_pairs SET mean_id=?, var_id=? WHERE word_a=? AND word_b=?",
+                (float(b.mean()), float(b.var()) if len(b) > 1 else 0.01, key[0], key[1])
+            )
 
     conn.commit()
 

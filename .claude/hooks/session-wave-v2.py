@@ -112,6 +112,7 @@ def init_db(conn):
             count INTEGER DEFAULT 0, plasticity REAL DEFAULT 1.0,
             energy REAL DEFAULT 0.0,
             mean_f REAL, var_f REAL,
+            mean_id REAL, var_id REAL,
             PRIMARY KEY (word_a, word_b));
         CREATE TABLE IF NOT EXISTS session_chain (
             word_prev TEXT, word_next TEXT, count INTEGER DEFAULT 1,
@@ -134,7 +135,7 @@ def init_db(conn):
         except Exception:
             pass
     # Add temporal sketch columns if missing (migration)
-    for col in ("mean_f", "var_f"):
+    for col in ("mean_f", "var_f", "mean_id", "var_id"):
         try:
             conn.execute(f"SELECT {col} FROM session_pairs LIMIT 1")
         except Exception:
@@ -149,8 +150,8 @@ def load_state(conn):
     for r in conn.execute("SELECT word, aud_phase, vis_phase FROM session_words"):
         aud[r[0]] = r[1]; vis[r[0]] = r[2]
     pairs = {}
-    for r in conn.execute("SELECT word_a,word_b,cos_a,cos_v,signed_a,signed_v,count,plasticity,energy,mean_f,var_f FROM session_pairs"):
-        pairs[(r[0], r[1])] = {'cos_a':r[2],'cos_v':r[3],'signed_a':r[4],'signed_v':r[5],'count':r[6],'plasticity':r[7] or 1.0,'energy':r[8] or 0.0,'mean_f':r[9],'var_f':r[10]}
+    for r in conn.execute("SELECT word_a,word_b,cos_a,cos_v,signed_a,signed_v,count,plasticity,energy,mean_f,var_f,mean_id,var_id FROM session_pairs"):
+        pairs[(r[0], r[1])] = {'cos_a':r[2],'cos_v':r[3],'signed_a':r[4],'signed_v':r[5],'count':r[6],'plasticity':r[7] or 1.0,'energy':r[8] or 0.0,'mean_f':r[9],'var_f':r[10],'mean_id':r[11],'var_id':r[12]}
     chain = {}
     for r in conn.execute("SELECT word_prev, word_next, count FROM session_chain"):
         chain[(r[0], r[1])] = r[2]
@@ -161,8 +162,8 @@ def save_state(conn, aud, vis, pairs, chain):
     for w in aud:
         conn.execute("INSERT OR REPLACE INTO session_words VALUES(?,?,?)", (w, aud[w], vis[w]))
     for (a, b), ps in pairs.items():
-        conn.execute("INSERT OR REPLACE INTO session_pairs(word_a,word_b,cos_a,cos_v,signed_a,signed_v,count,plasticity,energy,mean_f,var_f) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-                     (a, b, ps['cos_a'], ps['cos_v'], ps['signed_a'], ps['signed_v'], ps['count'], ps.get('plasticity', 1.0), ps.get('energy', 0.0), ps.get('mean_f'), ps.get('var_f')))
+        conn.execute("INSERT OR REPLACE INTO session_pairs(word_a,word_b,cos_a,cos_v,signed_a,signed_v,count,plasticity,energy,mean_f,var_f,mean_id,var_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                     (a, b, ps['cos_a'], ps['cos_v'], ps['signed_a'], ps['signed_v'], ps['count'], ps.get('plasticity', 1.0), ps.get('energy', 0.0), ps.get('mean_f'), ps.get('var_f'), ps.get('mean_id'), ps.get('var_id')))
     for (a, b), cnt in chain.items():
         conn.execute("INSERT OR REPLACE INTO session_chain VALUES(?,?,?)", (a, b, cnt))
     conn.commit()
@@ -203,7 +204,7 @@ def learn_sentence(toks, aud, vis, pairs, chain):
 
 
 # ── Wave recall (sparse, single query) ──
-def wave_recall_sparse(query_lemmas, aud, vis, pairs, chain, freshness_weight=True, top_k=30, accumulate_energy=False, temporal_anchor=None):
+def wave_recall_sparse(query_lemmas, aud, vis, pairs, chain, freshness_weight=True, top_k=30, accumulate_energy=False, temporal_anchor=None, temporal_mode='plasticity'):
     all_words = list(aud.keys())
     if not all_words: return []
     N = len(all_words)
@@ -220,11 +221,16 @@ def wave_recall_sparse(query_lemmas, aud, vis, pairs, chain, freshness_weight=Tr
             threshold = (1 - fresh) * FRESH_THRESHOLD_MAX
             if cos_strength < threshold:
                 continue
-        # B-plan: temporal edge modulation via sketch
-        if temporal_anchor is not None and ps.get('mean_f') is not None:
-            spread = max(math.sqrt(ps['var_f']) if ps.get('var_f') else 0.03, 0.03)
-            tw = math.exp(-((ps['mean_f'] - temporal_anchor) / spread) ** 2)
-            w *= tw
+        # Temporal edge modulation via sketch
+        if temporal_anchor is not None:
+            if temporal_mode == 'id' and ps.get('mean_id') is not None:
+                spread = max(math.sqrt(ps['var_id']) if ps.get('var_id') else 0.03, 0.03)
+                tw = math.exp(-((ps['mean_id'] - temporal_anchor) / spread) ** 2)
+                w *= tw
+            elif temporal_mode == 'plasticity' and ps.get('mean_f') is not None:
+                spread = max(math.sqrt(ps['var_f']) if ps.get('var_f') else 0.03, 0.03)
+                tw = math.exp(-((ps['mean_f'] - temporal_anchor) / spread) ** 2)
+                w *= tw
         if w > 0.001:
             edges.append((idx[a], idx[b], w))
             edge_pair_keys.append((a, b))
