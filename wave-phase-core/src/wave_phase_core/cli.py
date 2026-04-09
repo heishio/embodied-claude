@@ -24,6 +24,30 @@ DB = os.path.join(HOME, ".claude", "session-wave-v2.db")
 FRESH_THRESHOLD_MAX = 0.5
 DEGREE_LEAK_RATE = 0.001
 SENT_WORD_WEIGHT = 0.3
+ECHO_WEIGHT = 0.3
+ECHO_ENERGY_CAP = 5.0
+
+
+def load_echo(conn, word_idx):
+    """Load echo state from DB."""
+    N = len(word_idx)
+    echo = np.zeros(N)
+    try:
+        for r in conn.execute("SELECT word, activation FROM echo_state"):
+            if r[0] in word_idx:
+                echo[word_idx[r[0]]] = r[1]
+    except Exception:
+        pass
+    return echo
+
+
+def save_echo(conn, echo, all_words):
+    """Save echo state to DB."""
+    conn.execute("DELETE FROM echo_state")
+    nz = np.nonzero(np.abs(echo) > 0.001)[0]
+    for i in nz:
+        conn.execute("INSERT INTO echo_state VALUES(?,?)", (all_words[i], float(echo[i])))
+    conn.commit()
 
 
 def load_graph():
@@ -45,7 +69,7 @@ def load_graph():
 
 
 def bipartite_wave(query_lemmas, aud, vis, pairs, chain, sents,
-                   reach_threshold=0.005):
+                   reach_threshold=0.005, echo_u=None):
     """Single wave on word+sentence bipartite graph."""
     # Word nodes: 0..W-1
     all_words = list(aud.keys())
@@ -122,14 +146,24 @@ def bipartite_wave(query_lemmas, aud, vis, pairs, chain, sents,
     if u.sum() == 0:
         return [], [], []
 
+    # Add echo to recharge signal
+    u_total = u.copy()
+    if echo_u is not None:
+        # echo_u is W-sized (word nodes only), pad to N
+        echo_full = np.zeros(N)
+        echo_full[:W] = echo_u[:W] if len(echo_u) >= W else echo_u
+        echo_l2 = np.linalg.norm(echo_full)
+        if echo_l2 > 0.001:
+            u_total = u + np.maximum(echo_full / echo_l2, 0) * ECHO_WEIGHT
+
     # Wave propagation
     leak = 1.0 / (1 + degree * DEGREE_LEAK_RATE)
-    x = u * 0.3
+    x = u_total * 0.3
     v = np.zeros(N)
     for step in range(15):
         f = -0.3 * (L @ x)
         if step % 5 == 0:
-            f += 0.05 * (u - x)
+            f += 0.05 * (u_total - x)
         v = v * 0.8 - 0.3 * x * 0.1 + f
         x = np.clip(x + v, -1, 3)
         x *= leak
@@ -165,11 +199,40 @@ def recall(query_text, mode="broad"):
 
     reach = {"broad": 0.0005, "focus": 0.0015, "zoom": 0.0008}.get(mode, 0.0008)
 
+    # Load echo from DB (CoT: previous step's echo persists)
+    all_words = list(aud.keys())
+    word_idx = {w: i for i, w in enumerate(all_words)}
+    conn = sqlite3.connect(DB, timeout=3)
+    echo = load_echo(conn, word_idx)
+
     word_act, sent_scored, sent_data = bipartite_wave(
-        query_lemmas, aud, vis, pairs, chain, sents, reach_threshold=reach)
+        query_lemmas, aud, vis, pairs, chain, sents,
+        reach_threshold=reach, echo_u=echo)
 
     if not word_act:
+        conn.close()
         return "No activation from query."
+
+    # Update echo: blend current activation for next CoT step
+    W = len(all_words)
+    current_act = np.zeros(W)
+    for w, z in word_act.items():
+        if w in word_idx:
+            current_act[word_idx[w]] = z
+    for q in query_lemmas:
+        if q in word_idx:
+            current_act[word_idx[q]] = 0.5
+    # Accumulate (CoT steps build on each other)
+    echo_norm = np.linalg.norm(echo)
+    if echo_norm > 0.01:
+        echo = echo * 0.5 + current_act * 0.5
+    else:
+        echo = current_act.copy()
+    echo_l2 = np.linalg.norm(echo)
+    if echo_l2 > ECHO_ENERGY_CAP:
+        echo *= ECHO_ENERGY_CAP / echo_l2
+    save_echo(conn, echo, all_words)
+    conn.close()
 
     # Center words
     center = sorted(
