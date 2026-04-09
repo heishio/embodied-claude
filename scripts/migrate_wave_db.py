@@ -63,6 +63,8 @@ def migrate(db_path):
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             text TEXT, speaker TEXT, timestamp REAL, lemmas TEXT,
             plasticity REAL DEFAULT 0.5, memory_id TEXT);
+        CREATE TABLE IF NOT EXISTS echo_state (
+            word TEXT PRIMARY KEY, activation REAL);
     """)
 
     # 3. Column renames: freshness -> plasticity (SQLite 3.25+)
