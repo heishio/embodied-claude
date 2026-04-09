@@ -9,6 +9,7 @@ import os
 import re
 import sqlite3
 import sys
+import time
 
 if sys.platform == "win32":
     sys.stdout.reconfigure(encoding="utf-8")
@@ -35,7 +36,10 @@ def init_db(conn):
         CREATE TABLE IF NOT EXISTS session_pairs (
             word_a TEXT, word_b TEXT,
             cos_a REAL, cos_v REAL, signed_a REAL, signed_v REAL,
-            count INTEGER DEFAULT 0, avg_freshness REAL DEFAULT 1.0,
+            count INTEGER DEFAULT 0, plasticity REAL DEFAULT 1.0,
+            energy REAL DEFAULT 0.0,
+            mean_f REAL, var_f REAL,
+            mean_id REAL, var_id REAL,
             PRIMARY KEY (word_a, word_b));
         CREATE TABLE IF NOT EXISTS session_chain (
             word_prev TEXT, word_next TEXT, count INTEGER DEFAULT 1,
@@ -43,16 +47,10 @@ def init_db(conn):
         CREATE TABLE IF NOT EXISTS lt_sentences (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             text TEXT, speaker TEXT, timestamp REAL, lemmas TEXT,
-            freshness REAL DEFAULT 0.5, memory_id TEXT);
+            plasticity REAL DEFAULT 0.5, memory_id TEXT);
+        CREATE TABLE IF NOT EXISTS echo_state (
+            word TEXT PRIMARY KEY, activation REAL);
     """)
-    # Add memory_id column if missing
-    try:
-        conn.execute("SELECT memory_id FROM lt_sentences LIMIT 1")
-    except Exception:
-        try:
-            conn.execute("ALTER TABLE lt_sentences ADD COLUMN memory_id TEXT")
-        except Exception:
-            pass
 
 
 def load_state(conn):
@@ -60,8 +58,8 @@ def load_state(conn):
     for r in conn.execute("SELECT word, aud_phase, vis_phase FROM session_words"):
         aud[r[0]] = r[1]; vis[r[0]] = r[2]
     pairs = {}
-    for r in conn.execute("SELECT word_a,word_b,cos_a,cos_v,signed_a,signed_v,count,avg_freshness FROM session_pairs"):
-        pairs[(r[0], r[1])] = {'cos_a':r[2],'cos_v':r[3],'signed_a':r[4],'signed_v':r[5],'count':r[6],'avg_freshness':r[7] or 1.0}
+    for r in conn.execute("SELECT word_a,word_b,cos_a,cos_v,signed_a,signed_v,count,plasticity FROM session_pairs"):
+        pairs[(r[0], r[1])] = {'cos_a':r[2],'cos_v':r[3],'signed_a':r[4],'signed_v':r[5],'count':r[6],'plasticity':r[7] or 1.0}
     chain = {}
     for r in conn.execute("SELECT word_prev, word_next, count FROM session_chain"):
         chain[(r[0], r[1])] = r[2]
@@ -72,8 +70,8 @@ def save_state(conn, aud, vis, pairs, chain):
     for w in aud:
         conn.execute("INSERT OR REPLACE INTO session_words VALUES(?,?,?)", (w, aud[w], vis[w]))
     for (a, b), ps in pairs.items():
-        conn.execute("INSERT OR REPLACE INTO session_pairs(word_a,word_b,cos_a,cos_v,signed_a,signed_v,count,avg_freshness) VALUES(?,?,?,?,?,?,?,?)",
-                     (a, b, ps['cos_a'], ps['cos_v'], ps['signed_a'], ps['signed_v'], ps['count'], ps.get('avg_freshness', 1.0)))
+        conn.execute("INSERT OR REPLACE INTO session_pairs(word_a,word_b,cos_a,cos_v,signed_a,signed_v,count,plasticity) VALUES(?,?,?,?,?,?,?,?)",
+                     (a, b, ps['cos_a'], ps['cos_v'], ps['signed_a'], ps['signed_v'], ps['count'], ps.get('plasticity', 1.0)))
     for (a, b), cnt in chain.items():
         conn.execute("INSERT OR REPLACE INTO session_chain VALUES(?,?,?)", (a, b, cnt))
     conn.commit()
@@ -100,7 +98,7 @@ def learn_sentence(toks, aud, vis, pairs, chain):
             dv = float(wrap_pi(new_v[j] - new_v[i]))
             ca = float(np.cos(da)); cv = float(np.cos(dv))
             if key not in pairs:
-                pairs[key] = {'cos_a':ca,'cos_v':cv,'signed_a':da,'signed_v':dv,'count':0,'avg_freshness':1.0}
+                pairs[key] = {'cos_a':ca,'cos_v':cv,'signed_a':da,'signed_v':dv,'count':0,'plasticity':1.0}
             ps = pairs[key]
             ps['cos_a'] = (1-ETA_PAIR)*ps['cos_a'] + ETA_PAIR*ca
             ps['cos_v'] = (1-ETA_PAIR)*ps['cos_v'] + ETA_PAIR*cv
@@ -146,7 +144,6 @@ def main():
     aud, vis, pairs, chain = load_state(conn)
 
     sents = [s.strip() for s in re.split(r'[。！？\n\.]+', content) if len(s.strip()) > 2]
-    import time
     for sent_text in sents:
         sent_text = re.sub(r'[#*`\-|>]', '', sent_text).strip()
         if len(sent_text) < 3: continue
@@ -158,7 +155,7 @@ def main():
         learn_sentence(toks, aud, vis, pairs, chain)
         lemmas_str = ",".join(t['lemma'] for t in toks)
         conn.execute(
-            "INSERT INTO lt_sentences(text,speaker,timestamp,lemmas,freshness,memory_id) VALUES(?,?,?,?,?,?)",
+            "INSERT INTO lt_sentences(text,speaker,timestamp,lemmas,plasticity,memory_id) VALUES(?,?,?,?,?,?)",
             (sent_text[:200], 'diary', time.time(), lemmas_str, 1.0, memory_id)
         )
 
