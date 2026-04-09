@@ -41,6 +41,7 @@ try:
     from wave_phase_core import (
         audio_phase_accent, visual_phase, wrap_pi, kuramoto_chain,
         tokenize_sent, FUNC_WORDS, PAIR_WINDOW, ETA, ETA_PAIR,
+        plasticity_log_scale,
     )
 except ImportError:
     sys.exit(0)
@@ -405,10 +406,11 @@ def score_pool_sentences(query_lemmas, pool, conn, aud, vis, pairs, chain, accum
         return [], 0.0
 
     # Detect anchor: strongest hit that's been consolidated at least once
+    # Convert to log scale to match sketch's temporal coordinate
     anchor_fresh = None
     for _, _, _, sc, fresh, _ in scored:
         if fresh < 0.9 and sc > 0:
-            anchor_fresh = fresh
+            anchor_fresh = plasticity_log_scale(fresh)
             break
 
     if anchor_fresh is not None:

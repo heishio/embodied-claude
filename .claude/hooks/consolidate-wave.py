@@ -17,10 +17,15 @@ import numpy as np
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', 'wave-phase-core', 'src'))
 try:
-    from wave_phase_core import FUNC_WORDS, PAIR_WINDOW
+    from wave_phase_core import FUNC_WORDS, PAIR_WINDOW, plasticity_log_scale
 except ImportError:
     FUNC_WORDS = set()
     PAIR_WINDOW = 5
+    import math as _math
+    _LTD_FLOOR = 0.01
+    _LOG_RANGE = _math.log(1.0 / _LTD_FLOOR)
+    def plasticity_log_scale(p):
+        return _math.log(max(p, _LTD_FLOOR) / _LTD_FLOOR) / _LOG_RANGE
 
 if sys.platform == "win32":
     sys.stdout.reconfigure(encoding="utf-8")
@@ -173,7 +178,7 @@ def main():
             for j in range(i + 1, min(n, i + PAIR_WINDOW)):
                 key = tuple(sorted([content[i], content[j]]))
                 if key in pair_set:
-                    pair_freshness[key].append(fresh)
+                    pair_freshness[key].append(plasticity_log_scale(fresh))
     # Clear stale sketches first, then write fresh ones
     conn.execute("UPDATE session_pairs SET mean_f=NULL, var_f=NULL")
     sketch_count = 0
