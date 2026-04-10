@@ -44,8 +44,15 @@ try:
         plasticity_log_scale, ECHO_WEIGHT, ECHO_ENERGY_CAP,
         load_echo, save_echo,
     )
+    from wave_phase_core.phase import to_reading_text, _extract_accent, _hl_pattern
 except ImportError:
     sys.exit(0)
+
+try:
+    import pyopenjtalk
+    HAS_G2P = True
+except ImportError:
+    HAS_G2P = False
 
 # ── Constants ──
 POOL_MAX = 80
@@ -57,6 +64,12 @@ FRESH_THRESHOLD_MAX = 0.5  # old memories need cos > this to respond
 DEGREE_LEAK_RATE = 0.001   # high-degree nodes saturate faster
 TIMEOUT_SEC = 13
 ECHO_TOPIC_THRESHOLD = 0.1  # cos(echo, current) below this → topic switch → reset echo
+# Hybrid learn (phase-precession + gamma-sync analogy)
+SEQ_PULL = 0.40            # sequential x_aud → aud pull weight
+KUR_PULL = 0.10            # kuramoto output → aud pull weight
+CARRY_DECAY = 0.3          # inter-sentence carry-wave decay
+LEARN_DEGREE_LEAK = 0.005  # build_L leak for learning dynamics (stronger than recall)
+MORA_ENDS = {'a', 'i', 'u', 'e', 'o', 'A', 'I', 'U', 'E', 'O', 'N', 'cl'}
 
 # ── Speaker detection ──
 GO2RTC_SNAPSHOT = "http://localhost:1984/api/frame.jpeg?src=tapo_cam"
@@ -116,9 +129,6 @@ def init_db(conn):
             mean_f REAL, var_f REAL,
             mean_id REAL, var_id REAL,
             PRIMARY KEY (word_a, word_b));
-        CREATE TABLE IF NOT EXISTS session_chain (
-            word_prev TEXT, word_next TEXT, count INTEGER DEFAULT 1,
-            PRIMARY KEY (word_prev, word_next));
         CREATE TABLE IF NOT EXISTS session_sentences (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             text TEXT, speaker TEXT, timestamp REAL, lemmas TEXT,
@@ -155,60 +165,151 @@ def load_state(conn):
         aud[r[0]] = r[1]; vis[r[0]] = r[2]
     pairs = {}
     for r in conn.execute("SELECT word_a,word_b,cos_a,cos_v,signed_a,signed_v,count,plasticity,energy,mean_f,var_f,mean_id,var_id FROM session_pairs"):
-        pairs[(r[0], r[1])] = {'cos_a':r[2],'cos_v':r[3],'signed_a':r[4],'signed_v':r[5],'count':r[6],'plasticity':r[7] or 1.0,'energy':r[8] or 0.0,'mean_f':r[9],'var_f':r[10],'mean_id':r[11],'var_id':r[12]}
-    chain = {}
-    for r in conn.execute("SELECT word_prev, word_next, count FROM session_chain"):
-        chain[(r[0], r[1])] = r[2]
-    return aud, vis, pairs, chain
+        pairs[(r[0], r[1])] = {
+            'cos_a': r[2] if r[2] is not None else 0.0,
+            'cos_v': r[3] if r[3] is not None else 0.0,
+            'signed_a': r[4] if r[4] is not None else 0.0,
+            'signed_v': r[5] if r[5] is not None else 0.0,
+            'count': r[6] or 0,
+            'plasticity': r[7] or 1.0,
+            'energy': r[8] or 0.0,
+            'mean_f': r[9], 'var_f': r[10],
+            'mean_id': r[11], 'var_id': r[12],
+        }
+    return aud, vis, pairs
 
 
-def save_state(conn, aud, vis, pairs, chain):
+def save_state(conn, aud, vis, pairs):
     for w in aud:
         conn.execute("INSERT OR REPLACE INTO session_words VALUES(?,?,?)", (w, aud[w], vis[w]))
     for (a, b), ps in pairs.items():
         conn.execute("INSERT OR REPLACE INTO session_pairs(word_a,word_b,cos_a,cos_v,signed_a,signed_v,count,plasticity,energy,mean_f,var_f,mean_id,var_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
                      (a, b, ps['cos_a'], ps['cos_v'], ps['signed_a'], ps['signed_v'], ps['count'], ps.get('plasticity', 1.0), ps.get('energy', 0.0), ps.get('mean_f'), ps.get('var_f'), ps.get('mean_id'), ps.get('var_id')))
-    for (a, b), cnt in chain.items():
-        conn.execute("INSERT OR REPLACE INTO session_chain VALUES(?,?,?)", (a, b, cnt))
     conn.commit()
 
 
-# ── Learning ──
-def learn_sentence(toks, aud, vis, pairs, chain):
-    lems = [t['lemma'] for t in toks]
-    n = len(lems)
-    if n < 2: return
-    for t in toks:
-        l = t['lemma']
-        if l not in aud:
-            aud[l] = audio_phase_accent(l)
-            vis[l] = visual_phase(t['surface'])
-    new_a = kuramoto_chain(np.array([aud[l] for l in lems]))
-    new_v = kuramoto_chain(np.array([vis[l] for l in lems]))
-    for i, l in enumerate(lems):
-        aud[l] += ETA * (new_a[i] - aud[l])
-        vis[l] += ETA * (new_v[i] - vis[l])
+# ── Learning (hybrid: phase-precession + gamma-sync) ──
+# Sequential injection (theta-precession analogue) + carry-wave + kuramoto
+# pair sync (gamma-binding analogue). See wave_phase_changelog for the
+# ablation that selected seq0.40 + kur0.10 + pair=kuramoto.
+def _get_phonemes(word):
+    """Phoneme list + HL pattern for a word. Returns ([], []) on failure."""
+    if not HAS_G2P:
+        return [], []
+    try:
+        prepared = to_reading_text(word)
+        phons = pyopenjtalk.g2p(prepared).split(' ')
+        if not phons or phons == ['']:
+            return [], []
+        n_mora, accent = _extract_accent(prepared)
+        return phons, _hl_pattern(n_mora, accent)
+    except Exception:
+        return [], []
+
+
+def build_learn_L(pairs, word_idx, W):
+    """Build sparse Laplacian for learning dynamics from current pairs."""
+    edges = []
+    for (a, b), ps in pairs.items():
+        if ps['count'] < 1 or a not in word_idx or b not in word_idx:
+            continue
+        w = max(0.0, (ps['cos_a'] + ps['cos_v']) / 2) + ps['count'] / 200.0
+        if w > 0.001:
+            edges.append((word_idx[a], word_idx[b], w))
+    if not edges:
+        # Bootstrap: weak seed edges so first pass can start
+        for i in range(min(W, 200)):
+            for j in range(i + 1, min(W, i + 3)):
+                edges.append((i, j, 0.01))
+    degree = np.zeros(W)
+    for i, j, w in edges:
+        degree[i] += w; degree[j] += w
+    degree = np.maximum(degree, 0.01)
+    di = 1.0 / np.sqrt(degree)
+    rs, cs, vs = [], [], []
+    for i, j, w in edges:
+        nw = w * di[i] * di[j]
+        rs += [i, j]; cs += [j, i]; vs += [nw, nw]
+    A = sp.csr_matrix((vs, (rs, cs)), shape=(W, W))
+    dA = np.asarray(A.sum(axis=1)).flatten()
+    return sp.diags(dA) - A, 1.0 / (1 + degree * LEARN_DEGREE_LEAK)
+
+
+def learn_sentence(toks, aud, vis, pairs, word_idx, L, leak,
+                   x_aud, v_aud, x_vis, v_vis):
+    """Hybrid sequential+kuramoto learn. Returns updated carry state (x/v).
+
+    Precondition: caller has already registered new words into aud/vis/word_idx
+    and expanded x/v vectors to match, AND built L/leak against this expanded
+    word_idx. Failing that, L@x will shape-mismatch.
+    """
+    words = [t['lemma'] for t in toks]
+    surfaces = [t['surface'] for t in toks]
+    n = len(words)
+    if n < 2:
+        return x_aud, v_aud, x_vis, v_vis
+
+    # Sequential injection (phoneme-by-phoneme audio, one-shot visual)
+    for word, surface in zip(words, surfaces):
+        if word not in word_idx:
+            continue
+        wid = word_idx[word]
+        phons, hl = _get_phonemes(word)
+        if phons:
+            mi = 0
+            for ph in phons:
+                hv = hl[mi] if mi < len(hl) else 'L'
+                energy = (sum(ord(c) * 17 for c in ph) + (500 if hv == 'H' else 0)) % 1000 / 1000.0
+                x_aud[wid] += energy * 0.3
+                for _ in range(2):
+                    f = -0.3 * (L @ x_aud); v_aud = v_aud * 0.7 + f
+                    x_aud = np.clip(x_aud + v_aud, -1, 3); x_aud *= leak * 0.95
+                if ph in MORA_ENDS:
+                    mi += 1
+        else:
+            x_aud[wid] += 0.3
+            for _ in range(2):
+                f = -0.3 * (L @ x_aud); v_aud = v_aud * 0.7 + f
+                x_aud = np.clip(x_aud + v_aud, -1, 3); x_aud *= leak * 0.95
+
+        x_vis[wid] += visual_phase(surface) * 0.3 + 0.3
+        for _ in range(2):
+            f = -0.3 * (L @ x_vis); v_vis = v_vis * 0.7 + f
+            x_vis = np.clip(x_vis + v_vis, -1, 3); x_vis *= leak * 0.95
+
+    # Kuramoto output (used for pair cos and partial aud/vis drift)
+    new_a = kuramoto_chain(np.array([aud[l] for l in words]))
+    new_v = kuramoto_chain(np.array([vis[l] for l in words]))
+
+    # Blended long-term phase update: seq pull (ctx) + kura pull (BCM-like)
+    for wi, word in enumerate(words):
+        wid = word_idx[word]
+        aud[word] += ETA * SEQ_PULL * (float(x_aud[wid]) - aud[word])
+        vis[word] += ETA * SEQ_PULL * (float(x_vis[wid]) - vis[word])
+        aud[word] += ETA * KUR_PULL * (new_a[wi] - aud[word])
+        vis[word] += ETA * KUR_PULL * (new_v[wi] - vis[word])
+
+    # Pair cos/signed from kuramoto output (gamma-sync binding)
     for i in range(n):
-        for j in range(i+1, min(n, i+PAIR_WINDOW)):
-            key = tuple(sorted([lems[i], lems[j]]))
+        for j in range(i + 1, min(n, i + PAIR_WINDOW)):
+            key = tuple(sorted([words[i], words[j]]))
             da = float(wrap_pi(new_a[j] - new_a[i]))
             dv = float(wrap_pi(new_v[j] - new_v[i]))
             ca = float(np.cos(da)); cv = float(np.cos(dv))
             if key not in pairs:
-                pairs[key] = {'cos_a':ca,'cos_v':cv,'signed_a':da,'signed_v':dv,'count':0,'plasticity':1.0}
+                pairs[key] = {'cos_a': ca, 'cos_v': cv, 'signed_a': da, 'signed_v': dv, 'count': 0, 'plasticity': 1.0}
             ps = pairs[key]
-            ps['cos_a'] = (1-ETA_PAIR)*ps['cos_a'] + ETA_PAIR*ca
-            ps['cos_v'] = (1-ETA_PAIR)*ps['cos_v'] + ETA_PAIR*cv
-            ps['signed_a'] = (1-ETA_PAIR)*ps['signed_a'] + ETA_PAIR*da
-            ps['signed_v'] = (1-ETA_PAIR)*ps['signed_v'] + ETA_PAIR*dv
+            ps['cos_a'] = (1 - ETA_PAIR) * ps['cos_a'] + ETA_PAIR * ca
+            ps['cos_v'] = (1 - ETA_PAIR) * ps['cos_v'] + ETA_PAIR * cv
+            ps['signed_a'] = (1 - ETA_PAIR) * ps['signed_a'] + ETA_PAIR * da
+            ps['signed_v'] = (1 - ETA_PAIR) * ps['signed_v'] + ETA_PAIR * dv
             ps['count'] += 1
-    for i in range(n-1):
-        ck = (lems[i], lems[i+1])
-        chain[ck] = chain.get(ck, 0) + 1
+
+    return x_aud, v_aud, x_vis, v_vis
 
 
-# ── Wave recall (sparse, single query) ──
-def wave_recall_sparse(query_lemmas, aud, vis, pairs, chain, freshness_weight=True, top_k=30, accumulate_energy=False, temporal_anchor=None, temporal_mode='plasticity', echo_u=None):
+# ── Wave recall (sparse, sequential query injection) ──
+def wave_recall_sparse(query_lemmas, aud, vis, pairs, freshness_weight=True, top_k=30, accumulate_energy=False, temporal_anchor=None, temporal_mode='plasticity', echo_u=None):
     all_words = list(aud.keys())
     if not all_words: return []
     N = len(all_words)
@@ -218,8 +319,7 @@ def wave_recall_sparse(query_lemmas, aud, vis, pairs, chain, freshness_weight=Tr
     for (a, b), ps in pairs.items():
         if ps['count'] < 1 or a not in idx or b not in idx: continue
         cos_strength = max(0.0, (ps['cos_a'] + ps['cos_v']) / 2)
-        ch = chain.get((a, b), 0) + chain.get((b, a), 0)
-        w = cos_strength + ch / 30.0
+        w = cos_strength
         if freshness_weight:
             fresh = max(ps.get('plasticity', 1.0), 0.01)
             threshold = (1 - fresh) * FRESH_THRESHOLD_MAX
@@ -250,16 +350,17 @@ def wave_recall_sparse(query_lemmas, aud, vis, pairs, chain, freshness_weight=Tr
     A = sp.csr_matrix((vs, (rs, cs)), shape=(N, N))
     dA = np.asarray(A.sum(axis=1)).flatten()
     L = sp.diags(dA) - A
-    u = np.zeros(N)
-    for q in query_lemmas:
-        if q in idx: u[idx[q]] = 1.0
-    if u.sum() == 0: return []
-    # Add echo to recharge signal (context persistence)
-    u_total = u.copy()
+    # Sequential query injection: seed query words one-by-one so order affects
+    # the interference pattern (phase-precession analogue on the recall side).
+    valid_q = [q for q in query_lemmas if q in idx]
+    if not valid_q:
+        return []
+    # Echo (context persistence) is added as a background recharge signal.
+    u_echo = np.zeros(N)
     if echo_u is not None and len(echo_u) == N:
         echo_l2 = np.linalg.norm(echo_u)
         if echo_l2 > 0.001:
-            u_total = u + np.maximum(echo_u / echo_l2, 0) * ECHO_WEIGHT
+            u_echo = np.maximum(echo_u / echo_l2, 0) * ECHO_WEIGHT
     # Vectorized edge arrays for energy accumulation
     ei_i = np.array([e[0] for e in edges])
     ei_j = np.array([e[1] for e in edges])
@@ -267,10 +368,19 @@ def wave_recall_sparse(query_lemmas, aud, vis, pairs, chain, freshness_weight=Tr
     edge_energy = np.zeros(len(edges))
     # Degree saturation: high-degree nodes leak activation each step
     leak = 1.0 / (1 + degree * DEGREE_LEAK_RATE)
-    x = u_total * 0.3; v = np.zeros(N)
-    for step in range(15):
-        f = -0.3 * (L @ x)
-        if step % 5 == 0: f += 0.05 * (u_total - x)
+    x = u_echo * 0.3; v = np.zeros(N)
+    STEPS_PER_INJECT = 4
+    for q in valid_q:
+        x[idx[q]] += 0.3
+        for _ in range(STEPS_PER_INJECT):
+            f = -0.3 * (L @ x) + 0.05 * (u_echo - x)
+            v = v * 0.8 - 0.3 * x * 0.1 + f
+            x = np.clip(x + v, -1, 3)
+            x *= leak
+            edge_energy += np.abs(x[ei_i] * x[ei_j]) * ei_w
+    # Final relaxation
+    for step in range(8):
+        f = -0.3 * (L @ x) + 0.05 * (u_echo - x)
         v = v * 0.8 - 0.3 * x * 0.1 + f
         x = np.clip(x + v, -1, 3)
         x *= leak
@@ -302,12 +412,12 @@ def save_pool(pool):
         json.dump(pool, f, ensure_ascii=False)
 
 
-def build_pool(query_lemmas, conn, aud, vis, pairs, chain):
+def build_pool(query_lemmas, conn, aud, vis, pairs):
     """Step 1+2: Build pool from session + LT sentences."""
     pool = {"session_sids": [], "lt_sids": [], "keywords": list(query_lemmas), "last_update": time.time()}
 
     # Step 1: Wave recall on session sentences
-    activated = wave_recall_sparse(query_lemmas, aud, vis, pairs, chain, freshness_weight=True, top_k=30)
+    activated = wave_recall_sparse(query_lemmas, aud, vis, pairs, freshness_weight=True, top_k=30)
     activated_words = [w for w, z in activated if z > 0.005]
 
     # Score session sentences
@@ -367,7 +477,7 @@ def build_pool(query_lemmas, conn, aud, vis, pairs, chain):
     return pool
 
 
-def score_pool_sentences(query_lemmas, pool, conn, aud, vis, pairs, chain, accumulate_energy=False, echo_u=None):
+def score_pool_sentences(query_lemmas, pool, conn, aud, vis, pairs, accumulate_energy=False, echo_u=None):
     """Step 3: Semantic wave → temporal zoom → re-seed."""
     # Collect pool sentences with freshness (session + LT)
     pool_sents = []
@@ -411,8 +521,12 @@ def score_pool_sentences(query_lemmas, pool, conn, aud, vis, pairs, chain, accum
         return scored
 
     # Pass 1: Semantic wave recall (energy only on this pass)
-    all_query = list(set(query_lemmas + pool.get("keywords", [])[:5]))
-    activated = wave_recall_sparse(all_query[:8], aud, vis, pairs, chain,
+    # Preserve order from query_lemmas (sequential injection needs it)
+    seen = set(); all_query = []
+    for q in list(query_lemmas) + list(pool.get("keywords", []))[:5]:
+        if q not in seen:
+            seen.add(q); all_query.append(q)
+    activated = wave_recall_sparse(all_query[:8], aud, vis, pairs,
                                    freshness_weight=True, top_k=50,
                                    accumulate_energy=accumulate_energy,
                                    echo_u=echo_u)
@@ -432,7 +546,7 @@ def score_pool_sentences(query_lemmas, pool, conn, aud, vis, pairs, chain, accum
 
     if anchor_fresh is not None:
         # B-plan: temporal edge modulation via sketch (re-run wave with anchor)
-        activated2 = wave_recall_sparse(all_query[:8], aud, vis, pairs, chain,
+        activated2 = wave_recall_sparse(all_query[:8], aud, vis, pairs,
                                         freshness_weight=True, top_k=50,
                                         temporal_anchor=anchor_fresh,
                                         echo_u=echo_u)
@@ -469,9 +583,15 @@ def main():
 
     conn = sqlite3.connect(SESSION_DB, timeout=3)
     init_db(conn)
-    aud, vis, pairs, chain = load_state(conn)
+    aud, vis, pairs = load_state(conn)
 
-    # Learn input
+    # Build word_idx for sequential learning dynamics
+    word_idx = {w: i for i, w in enumerate(aud.keys())}
+    W = len(word_idx)
+    x_aud = np.zeros(W); v_aud = np.zeros(W)
+    x_vis = np.zeros(W); v_vis = np.zeros(W)
+
+    # Learn input (hybrid: sequential + carry-wave + kuramoto pair sync)
     all_query_lemmas = []
     current_sids = []
     for sent_text in sents:
@@ -483,7 +603,29 @@ def main():
                 aud[speaker] = audio_phase_accent(speaker)
                 vis[speaker] = visual_phase(speaker)
             toks = [sp_tok] + toks
-        learn_sentence(toks, aud, vis, pairs, chain)
+        # Register new words BEFORE build_L so L/leak/x_v shapes stay aligned
+        for t in toks:
+            w, s = t['lemma'], t['surface']
+            if w not in aud:
+                aud[w] = audio_phase_accent(w)
+                vis[w] = visual_phase(s)
+            if w not in word_idx:
+                word_idx[w] = len(word_idx)
+        new_W = len(word_idx)
+        if new_W > len(x_aud):
+            pad = new_W - len(x_aud)
+            x_aud = np.concatenate([x_aud, np.zeros(pad)])
+            v_aud = np.concatenate([v_aud, np.zeros(pad)])
+            x_vis = np.concatenate([x_vis, np.zeros(pad)])
+            v_vis = np.concatenate([v_vis, np.zeros(pad)])
+        L, leak = build_learn_L(pairs, word_idx, new_W)
+        if L is not None:
+            x_aud, v_aud, x_vis, v_vis = learn_sentence(
+                toks, aud, vis, pairs, word_idx, L, leak,
+                x_aud, v_aud, x_vis, v_vis)
+            # Inter-sentence carry decay
+            x_aud *= CARRY_DECAY; v_aud *= CARRY_DECAY
+            x_vis *= CARRY_DECAY; v_vis *= CARRY_DECAY
         for t in toks:
             if t.get('pos') == '名詞' and t['lemma'] not in FUNC_WORDS:
                 if len(t['lemma']) >= 1 and t['lemma'] != speaker:
@@ -492,7 +634,7 @@ def main():
         conn.execute("INSERT INTO session_sentences(text,speaker,timestamp,lemmas,plasticity) VALUES(?,?,?,?,1.0)",
                      (sent_text, speaker, time.time(), lemmas_str))
         current_sids.append(conn.execute("SELECT last_insert_rowid()").fetchone()[0])
-    save_state(conn, aud, vis, pairs, chain)
+    save_state(conn, aud, vis, pairs)
 
     if not all_query_lemmas:
         conn.close()
@@ -521,18 +663,18 @@ def main():
 
     if not need_rebuild:
         # Check abruptness: quick activation test on current pool
-        top, activation = score_pool_sentences(query, pool, conn, aud, vis, pairs, chain, echo_u=echo)
+        top, activation = score_pool_sentences(query, pool, conn, aud, vis, pairs, echo_u=echo)
         if activation < ABRUPT_THRESHOLD:
             need_rebuild = True
 
     if need_rebuild and time.time() - t0 < TIMEOUT_SEC - 3:
-        pool = build_pool(query, conn, aud, vis, pairs, chain)
+        pool = build_pool(query, conn, aud, vis, pairs)
         save_pool(pool)
 
     # Final recall from pool (energy accumulation only here)
     if time.time() - t0 < TIMEOUT_SEC - 2:
-        top, activation = score_pool_sentences(query, pool, conn, aud, vis, pairs, chain, accumulate_energy=True, echo_u=echo)
-        save_state(conn, aud, vis, pairs, chain)  # persist accumulated energy
+        top, activation = score_pool_sentences(query, pool, conn, aud, vis, pairs, accumulate_energy=True, echo_u=echo)
+        save_state(conn, aud, vis, pairs)  # persist accumulated energy
         # Exclude current message
         exclude = set(f"s:{sid}" for sid in current_sids)
         top = [(s, t, sp, sc) for s, t, sp, sc in top if s not in exclude]
@@ -545,7 +687,7 @@ def main():
 
     # Update echo: run a quick wave recall with echo to get current activation
     if time.time() - t0 < TIMEOUT_SEC - 1:
-        act_with_echo = wave_recall_sparse(query[:4], aud, vis, pairs, chain,
+        act_with_echo = wave_recall_sparse(query[:4], aud, vis, pairs,
                                            freshness_weight=True, top_k=50,
                                            echo_u=echo)
         # Build current activation vector

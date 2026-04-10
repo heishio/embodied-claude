@@ -53,9 +53,6 @@ def init_db(conn):
             mean_f REAL, var_f REAL,
             mean_id REAL, var_id REAL,
             PRIMARY KEY (word_a, word_b));
-        CREATE TABLE IF NOT EXISTS session_chain (
-            word_prev TEXT, word_next TEXT, count INTEGER DEFAULT 1,
-            PRIMARY KEY (word_prev, word_next));
         CREATE TABLE IF NOT EXISTS session_sentences (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             text TEXT, speaker TEXT, timestamp REAL, lemmas TEXT,

@@ -52,9 +52,6 @@ def migrate(db_path):
             mean_f REAL, var_f REAL,
             mean_id REAL, var_id REAL,
             PRIMARY KEY (word_a, word_b));
-        CREATE TABLE IF NOT EXISTS session_chain (
-            word_prev TEXT, word_next TEXT, count INTEGER DEFAULT 1,
-            PRIMARY KEY (word_prev, word_next));
         CREATE TABLE IF NOT EXISTS session_sentences (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             text TEXT, speaker TEXT, timestamp REAL, lemmas TEXT,
@@ -140,10 +137,6 @@ def import_memories(db_path, memory_db=MEMORY_DB):
             'cos_a': r[2], 'cos_v': r[3], 'signed_a': r[4], 'signed_v': r[5],
             'count': r[6], 'plasticity': r[7] or 1.0
         }
-    chain = {}
-    for r in sess_conn.execute("SELECT word_prev, word_next, count FROM session_chain"):
-        chain[(r[0], r[1])] = r[2]
-
     # Check existing memory_ids to avoid duplicates
     existing_mids = set()
     for r in sess_conn.execute("SELECT memory_id FROM lt_sentences WHERE memory_id IS NOT NULL"):
@@ -208,9 +201,6 @@ def import_memories(db_path, memory_db=MEMORY_DB):
                     ps['count'] += 1
                     old_p = ps.get('plasticity', fw)
                     ps['plasticity'] = old_p * 0.9 + fw * 0.1
-            for i in range(n - 1):
-                ck = (lems[i], lems[i + 1])
-                chain[ck] = chain.get(ck, 0) + 1
 
             lemmas_str = ",".join(t['lemma'] for t in toks)
             sess_conn.execute(
@@ -230,15 +220,13 @@ def import_memories(db_path, memory_db=MEMORY_DB):
             "INSERT OR REPLACE INTO session_pairs (word_a,word_b,cos_a,cos_v,signed_a,signed_v,count,plasticity) VALUES (?,?,?,?,?,?,?,?)",
             (a, b, ps['cos_a'], ps['cos_v'], ps['signed_a'], ps['signed_v'], ps['count'], ps.get('plasticity', 1.0))
         )
-    for (a, b), cnt in chain.items():
-        sess_conn.execute("INSERT OR REPLACE INTO session_chain VALUES (?, ?, ?)", (a, b, cnt))
     sess_conn.commit()
     sess_conn.close()
 
     elapsed = time.time() - t0
     print(f"\nImport complete!")
     print(f"  new sentences: {total_sents} (skipped {skipped_dup} duplicates)")
-    print(f"  vocab: {len(aud)} words, pairs: {len(pairs)}, chain: {len(chain)}")
+    print(f"  vocab: {len(aud)} words, pairs: {len(pairs)}")
     print(f"  elapsed: {elapsed:.1f}s")
 
 

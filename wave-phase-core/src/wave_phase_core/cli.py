@@ -2,7 +2,9 @@
 """wave_recall CLI - Bipartite (word+sentence) wave recall.
 
 Single wave propagation on a graph containing both word and sentence nodes.
-Word-word edges from pair cos + chain, word-sentence edges from membership.
+Word-word edges from pair cos, word-sentence edges from membership. Query
+lemmas are injected sequentially so the interference pattern carries order
+information (phase-precession analogue on the recall side).
 
 Usage: python -m wave_phase_core.cli [--mode broad|focus|zoom] "query text"
 """
@@ -34,17 +36,14 @@ def load_graph():
     pairs = {}
     for r in conn.execute("SELECT word_a,word_b,cos_a,cos_v,count,plasticity FROM session_pairs"):
         pairs[(r[0], r[1])] = {'cos_a': r[2], 'cos_v': r[3], 'count': r[4], 'plasticity': r[5] or 1.0}
-    chain = {}
-    for r in conn.execute("SELECT word_prev, word_next, count FROM session_chain"):
-        chain[(r[0], r[1])] = r[2]
     sents = conn.execute(
         "SELECT id, text, lemmas, plasticity FROM lt_sentences ORDER BY id"
     ).fetchall()
     conn.close()
-    return aud, vis, pairs, chain, sents
+    return aud, vis, pairs, sents
 
 
-def bipartite_wave(query_lemmas, aud, vis, pairs, chain, sents,
+def bipartite_wave(query_lemmas, aud, vis, pairs, sents,
                    reach_threshold=0.005, echo_u=None):
     """Single wave on word+sentence bipartite graph."""
     # Word nodes: 0..W-1
@@ -80,8 +79,7 @@ def bipartite_wave(query_lemmas, aud, vis, pairs, chain, sents,
         if ps['count'] < 1 or a not in word_idx or b not in word_idx:
             continue
         cos_s = max(0.0, (ps['cos_a'] + ps['cos_v']) / 2)
-        ch = chain.get((a, b), 0) + chain.get((b, a), 0)
-        w = cos_s + ch / 30.0
+        w = cos_s
         fresh = max(ps.get('plasticity', 1.0), 0.01)
         thr = (1 - fresh) * FRESH_THRESHOLD_MAX
         if cos_s < thr:
@@ -114,37 +112,40 @@ def bipartite_wave(query_lemmas, aud, vis, pairs, chain, sents,
     dA = np.asarray(A.sum(axis=1)).flatten()
     L = sp.diags(dA) - A
 
-    # Initial energy on query words
-    u = np.zeros(N)
-    for q in query_lemmas:
-        if q in word_idx:
-            u[word_idx[q]] = 1.0
-    if u.sum() == 0:
+    # Sequential query injection: seed query words one-by-one so order
+    # affects the interference pattern on the bipartite graph.
+    valid_q = [q for q in query_lemmas if q in word_idx]
+    if not valid_q:
         return [], [], []
 
-    # Add echo to recharge signal
-    u_total = u.copy()
+    # Echo as background recharge (word nodes only, pad to N)
+    u_echo = np.zeros(N)
     if echo_u is not None:
-        # echo_u is W-sized (word nodes only), pad to N
         echo_full = np.zeros(N)
         echo_full[:W] = echo_u[:W] if len(echo_u) >= W else echo_u
         echo_l2 = np.linalg.norm(echo_full)
         if echo_l2 > 0.001:
-            u_total = u + np.maximum(echo_full / echo_l2, 0) * ECHO_WEIGHT
+            u_echo = np.maximum(echo_full / echo_l2, 0) * ECHO_WEIGHT
 
-    # Wave propagation
     leak = 1.0 / (1 + degree * DEGREE_LEAK_RATE)
-    x = u_total * 0.3
+    x = u_echo * 0.3
     v = np.zeros(N)
-    for step in range(15):
-        f = -0.3 * (L @ x)
-        if step % 5 == 0:
-            f += 0.05 * (u_total - x)
+    STEPS_PER_INJECT = 4
+    for q in valid_q:
+        x[word_idx[q]] += 0.3
+        for _ in range(STEPS_PER_INJECT):
+            f = -0.3 * (L @ x) + 0.05 * (u_echo - x)
+            v = v * 0.8 - 0.3 * x * 0.1 + f
+            x = np.clip(x + v, -1, 3)
+            x *= leak
+    # Final relaxation to settle sentence-node activations
+    for step in range(8):
+        f = -0.3 * (L @ x) + 0.05 * (u_echo - x)
         v = v * 0.8 - 0.3 * x * 0.1 + f
         x = np.clip(x + v, -1, 3)
         x *= leak
 
-    # Word activations (for center/chain output)
+    # Word activations (for center output)
     word_act = {}
     for i in range(W):
         if x[i] > 0.001:
@@ -164,7 +165,7 @@ def bipartite_wave(query_lemmas, aud, vis, pairs, chain, sents,
 
 def recall(query_text, mode="broad"):
     """mode: broad (wide topic), focus (tight), zoom (temporal anchor)"""
-    aud, vis, pairs, chain, sents = load_graph()
+    aud, vis, pairs, sents = load_graph()
 
     toks = tokenize_sent(query_text)
     if not toks:
@@ -182,7 +183,7 @@ def recall(query_text, mode="broad"):
     echo = load_echo(conn, word_idx)
 
     word_act, sent_scored, sent_data = bipartite_wave(
-        query_lemmas, aud, vis, pairs, chain, sents,
+        query_lemmas, aud, vis, pairs, sents,
         reach_threshold=reach, echo_u=echo)
 
     if not word_act:
@@ -218,31 +219,6 @@ def recall(query_text, mode="broad"):
     )[:5]
     center_words = [w for w, _ in center]
 
-    # Chain sequences from activated words
-    content_topic = {w for w, z in word_act.items() if z > 0.003 and len(w) >= 2}
-    fwd = {}
-    for (p, n), c in chain.items():
-        if p in content_topic and n in content_topic and c >= 2:
-            if p not in fwd or c > chain.get((p, fwd[p]), 0):
-                fwd[p] = n
-    all_nexts = set(fwd.values())
-    starts = sorted([w for w in fwd if w not in all_nexts],
-                    key=lambda w: -word_act.get(w, 0))[:3]
-    if not starts and fwd:
-        starts = sorted(fwd.keys(), key=lambda w: -word_act.get(w, 0))[:3]
-    used_chain = set()
-    sequences = []
-    for start in starts:
-        seq = [start]
-        used_chain.add(start)
-        cur = start
-        while cur in fwd and fwd[cur] not in used_chain:
-            cur = fwd[cur]
-            seq.append(cur)
-            used_chain.add(cur)
-        if len(seq) >= 2:
-            sequences.append(seq)
-
     # Block reconstruction from top sentence hits
     NEIGHBOR = 4
     blocks = []
@@ -271,9 +247,6 @@ def recall(query_text, mode="broad"):
     # Format output
     lines = []
     lines.append(f"[wave-recall] q={query_lemmas[:4]} center={center_words[:4]} sents={len(sent_scored)}")
-    if sequences:
-        for seq in sequences[:3]:
-            lines.append(f"  chain: {'→'.join(seq)}")
     for i, block in enumerate(blocks):
         lines.append(f"  --- block {i+1} ---")
         for bl in block:

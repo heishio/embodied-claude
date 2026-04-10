@@ -64,6 +64,14 @@ def main():
 
     total_ms = round((time.time() - t0) * 1000)
 
+    # Save result to temp file for other hooks
+    result_file = os.path.join(CAPTURE_DIR, "latest_result.json")
+    try:
+        with open(result_file, "w", encoding="utf-8") as f:
+            json.dump(result, f, ensure_ascii=False)
+    except Exception:
+        pass
+
     # 結果をstdoutに出力
     persons = result.get("persons")
     if persons:
