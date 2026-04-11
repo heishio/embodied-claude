@@ -118,3 +118,10 @@ FUNC_WORDS = {
     'ば', 'ず', 'なり', 'より', 'から', 'まで', 'ため', 'けれ', 'ても', 'か',
     'ね', 'よ', 'な', 'や', 'ぞ', 'ぜ', 'って', 'ます', 'ました',
 }
+
+# Speaker tokens are injected by session-wave-v2.py into sentence lemmas as a
+# cheap "who said it" label. Without a real speaker modality they end up as
+# super-hub nodes that drag recall toward the speaker themselves. Strip them
+# from content-word counting in wave_recall until multi-modal speaker cues are
+# in place.
+SPEAKER_TOKENS = {'シオ', 'クオ'}
