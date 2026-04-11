@@ -21,6 +21,11 @@
             "type": "command",
             "command": ".claude/hooks/run-say-buffer.cmd",
             "timeout": 5
+          },
+          {
+            "type": "command",
+            "command": ".claude/hooks/run-say-log.cmd",
+            "timeout": 5
           }
         ]
       },
@@ -35,7 +40,17 @@
         ]
       }
     ],
-    "Stop": [],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": ".claude/hooks/run-stop-log.cmd",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
     "SessionEnd": [
       {
         "hooks": [

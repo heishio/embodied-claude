@@ -29,6 +29,12 @@ SENT_WORD_WEIGHT = 0.3
 
 
 def load_graph():
+    """Load word-graph + sentence bank.
+
+    sents: list of (id, text, lemmas, plasticity, scope) where scope is
+    'session' | 'lt'. session_sentences and lt_sentences can share numeric
+    IDs, so scope disambiguates them downstream (echo keys use the tuple).
+    """
     conn = sqlite3.connect(DB, timeout=3)
     aud, vis = {}, {}
     for r in conn.execute("SELECT word, aud_phase, vis_phase FROM session_words"):
@@ -36,29 +42,44 @@ def load_graph():
     pairs = {}
     for r in conn.execute("SELECT word_a,word_b,cos_a,cos_v,count,plasticity FROM session_pairs"):
         pairs[(r[0], r[1])] = {'cos_a': r[2], 'cos_v': r[3], 'count': r[4], 'plasticity': r[5] or 1.0}
-    sents = conn.execute(
-        "SELECT id, text, lemmas, plasticity FROM lt_sentences ORDER BY id"
-    ).fetchall()
+    sents = []
+    for r in conn.execute(
+            "SELECT id, text, lemmas, plasticity FROM session_sentences ORDER BY id"):
+        sents.append((r[0], r[1], r[2], r[3] or 1.0, 'session'))
+    for r in conn.execute(
+            "SELECT id, text, lemmas, plasticity FROM lt_sentences ORDER BY id"):
+        sents.append((r[0], r[1], r[2], r[3] or 1.0, 'lt'))
     conn.close()
     return aud, vis, pairs, sents
 
 
 def bipartite_wave(query_lemmas, aud, vis, pairs, sents,
-                   reach_threshold=0.005, echo_u=None):
-    """Single wave on word+sentence bipartite graph."""
+                   reach_threshold=0.005, echo_u=None, sent_echo_u=None):
+    """Single wave on word+sentence bipartite graph.
+
+    echo_u: word-level echo (W,) — background recharge for word nodes
+    sent_echo_u: sentence-level echo, dict[sid] -> activation
+                 (working memory of recently activated sentences)
+    """
     # Word nodes: 0..W-1
     all_words = list(aud.keys())
     W = len(all_words)
     word_idx = {w: i for i, w in enumerate(all_words)}
 
     # Parse sentences → sentence nodes: W..W+S-1
+    # Each input row may be 4-tuple (legacy) or 5-tuple (with scope tag).
     sent_data = []
-    ids = [s[0] for s in sents]
-    if not ids:
+    if not sents:
         return [], [], []
+    ids = [s[0] for s in sents]
     min_id, max_id = min(ids), max(ids)
     id_range = max(max_id - min_id, 1)
-    for sid, text, lemmas_str, plast in sents:
+    for row in sents:
+        if len(row) == 5:
+            sid, text, lemmas_str, plast, scope = row
+        else:
+            sid, text, lemmas_str, plast = row
+            scope = 'lt'
         if not lemmas_str:
             continue
         content = [l for l in lemmas_str.split(",")
@@ -66,7 +87,7 @@ def bipartite_wave(query_lemmas, aud, vis, pairs, sents,
         if len(content) < 2:
             continue
         norm_id = (sid - min_id) / id_range
-        sent_data.append((sid, text, content, norm_id, plast or 0.01))
+        sent_data.append((sid, text, content, norm_id, plast or 0.01, scope))
 
     S = len(sent_data)
     N = W + S
@@ -88,7 +109,7 @@ def bipartite_wave(query_lemmas, aud, vis, pairs, sents,
             edges.append((word_idx[a], word_idx[b], w))
 
     # Sentence-word edges
-    for si, (sid, text, content, norm_id, plast) in enumerate(sent_data):
+    for si, (sid, text, content, norm_id, plast, scope) in enumerate(sent_data):
         sent_node = W + si
         n_c = len(content)
         w = SENT_WORD_WEIGHT / max(math.sqrt(n_c), 1)
@@ -118,14 +139,21 @@ def bipartite_wave(query_lemmas, aud, vis, pairs, sents,
     if not valid_q:
         return [], [], []
 
-    # Echo as background recharge (word nodes only, pad to N)
+    # Echo as background recharge (words + sentences)
     u_echo = np.zeros(N)
     if echo_u is not None:
-        echo_full = np.zeros(N)
-        echo_full[:W] = echo_u[:W] if len(echo_u) >= W else echo_u
-        echo_l2 = np.linalg.norm(echo_full)
-        if echo_l2 > 0.001:
-            u_echo = np.maximum(echo_full / echo_l2, 0) * ECHO_WEIGHT
+        u_echo[:W] = echo_u[:W] if len(echo_u) >= W else echo_u
+    if sent_echo_u is not None:
+        # sent_echo_u: dict[(scope, sid)] -> activation
+        for si, (sid, _, _, _, _, scope) in enumerate(sent_data):
+            key = (scope, sid)
+            if key in sent_echo_u:
+                u_echo[W + si] = sent_echo_u[key]
+    echo_l2 = np.linalg.norm(u_echo)
+    if echo_l2 > 0.001:
+        u_echo = np.maximum(u_echo / echo_l2, 0) * ECHO_WEIGHT
+    else:
+        u_echo = np.zeros(N)
 
     leak = 1.0 / (1 + degree * DEGREE_LEAK_RATE)
     x = u_echo * 0.3
@@ -156,8 +184,8 @@ def bipartite_wave(query_lemmas, aud, vis, pairs, sents,
     for si in range(S):
         act = float(x[W + si])
         if act > reach_threshold:
-            sid, text, content, norm_id, plast = sent_data[si]
-            sent_scored.append((sid, text, act, norm_id, si))
+            sid, text, content, norm_id, plast, scope = sent_data[si]
+            sent_scored.append((sid, text, act, norm_id, si, scope))
     sent_scored.sort(key=lambda r: -r[2])
 
     return word_act, sent_scored, sent_data
@@ -182,9 +210,28 @@ def recall(query_text, mode="broad"):
     conn = sqlite3.connect(DB, timeout=3)
     echo = load_echo(conn, word_idx)
 
+    # Load sentence-level echo from both scopes.  Keys are (scope, sid)
+    # tuples to avoid collision between session_sentences.id and lt_sentences.id.
+    from .constants import load_sent_echo
+    sess_ids = [s[0] for s in sents if len(s) > 4 and s[4] == 'session']
+    lt_ids = [s[0] for s in sents if len(s) > 4 and s[4] == 'lt']
+    sess_idx_map = {sid: i for i, sid in enumerate(sess_ids)}
+    lt_idx_map = {sid: i for i, sid in enumerate(lt_ids)}
+    sess_echo_vec = load_sent_echo(conn, sess_idx_map, scope='session')
+    lt_echo_vec = load_sent_echo(conn, lt_idx_map, scope='lt')
+    sent_echo_dict = {}
+    for sid in sess_ids:
+        v = sess_echo_vec[sess_idx_map[sid]]
+        if abs(v) > 0.001:
+            sent_echo_dict[('session', sid)] = float(v)
+    for sid in lt_ids:
+        v = lt_echo_vec[lt_idx_map[sid]]
+        if abs(v) > 0.001:
+            sent_echo_dict[('lt', sid)] = float(v)
+
     word_act, sent_scored, sent_data = bipartite_wave(
         query_lemmas, aud, vis, pairs, sents,
-        reach_threshold=reach, echo_u=echo)
+        reach_threshold=reach, echo_u=echo, sent_echo_u=sent_echo_dict)
 
     if not word_act:
         conn.close()
@@ -223,9 +270,9 @@ def recall(query_text, mode="broad"):
     NEIGHBOR = 4
     blocks = []
     used_indices = set()
-    activated_sids = {sid for sid, _, _, _, _ in sent_scored[:5]}
+    activated_sids = {sid for sid, _, _, _, _, _ in sent_scored[:5]}
 
-    for sid, text, act, norm_id, si in sent_scored[:3]:
+    for sid, text, act, norm_id, si, scope in sent_scored[:3]:
         if si in used_indices:
             continue
         block_indices = []
@@ -236,7 +283,7 @@ def recall(query_text, mode="broad"):
                 used_indices.add(ni)
         block_lines = []
         for ni in sorted(block_indices):
-            _, btxt, bcontent, _, _ = sent_data[ni]
+            _, btxt, bcontent, _, _, _ = sent_data[ni]
             # Include if any content word is activated, or if it's the hit itself
             topic_hit = any(word_act.get(l, 0) > 0.002 for l in bcontent)
             if topic_hit or ni == si:

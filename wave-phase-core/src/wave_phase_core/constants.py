@@ -20,7 +20,7 @@ def plasticity_log_scale(p: float) -> float:
     return math.log(max(p, LTD_FLOOR) / LTD_FLOOR) / _LOG_RANGE
 
 
-ECHO_WEIGHT = 0.3
+ECHO_WEIGHT = 0.15  # background recharge intensity (was 0.3 — softened for ふんわり影響)
 ECHO_ENERGY_CAP = 5.0
 
 
@@ -45,6 +45,69 @@ def save_echo(conn, echo, all_words):
     nz = np.nonzero(np.abs(echo) > 0.001)[0]
     for i in nz:
         conn.execute("INSERT INTO echo_state VALUES(?,?)", (all_words[i], float(echo[i])))
+    conn.commit()
+
+
+def _ensure_sent_echo_schema(conn):
+    """Ensure sent_echo_state exists with (scope, sent_id) composite key.
+    Scope values: 'session' | 'lt'. This prevents id collision between
+    session_sentences and lt_sentences which can share numeric IDs.
+    """
+    cur = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='sent_echo_state'")
+    if cur.fetchone() is None:
+        conn.execute("CREATE TABLE sent_echo_state ("
+                     "scope TEXT NOT NULL, "
+                     "sent_id INTEGER NOT NULL, "
+                     "activation REAL, "
+                     "updated_at REAL, "
+                     "PRIMARY KEY (scope, sent_id))")
+        return
+    # Migrate old (sent_id PK only) schema
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(sent_echo_state)")]
+    if 'scope' not in cols:
+        conn.execute("DROP TABLE sent_echo_state")
+        conn.execute("CREATE TABLE sent_echo_state ("
+                     "scope TEXT NOT NULL, "
+                     "sent_id INTEGER NOT NULL, "
+                     "activation REAL, "
+                     "updated_at REAL, "
+                     "PRIMARY KEY (scope, sent_id))")
+
+
+def load_sent_echo(conn, sent_idx, scope='session'):
+    """Load sentence echo for a given scope.
+    sent_idx: dict[sid] -> i.  Returns np vector of size len(sent_idx).
+    """
+    import numpy as np
+    N = len(sent_idx)
+    echo = np.zeros(N)
+    try:
+        _ensure_sent_echo_schema(conn)
+        cur = conn.execute(
+            "SELECT sent_id, activation FROM sent_echo_state WHERE scope=?",
+            (scope,))
+        for sid, act in cur.fetchall():
+            if sid in sent_idx:
+                echo[sent_idx[sid]] = act
+    except Exception:
+        pass
+    return echo
+
+
+def save_sent_echo(conn, echo, sent_ids, scope='session'):
+    """Save sentence echo for a given scope.
+    sent_ids[i] = sid for echo index i.
+    """
+    import numpy as np
+    import time as _time
+    _ensure_sent_echo_schema(conn)
+    conn.execute("DELETE FROM sent_echo_state WHERE scope=?", (scope,))
+    nz = np.nonzero(np.abs(echo) > 0.001)[0]
+    now = _time.time()
+    for i in nz:
+        conn.execute("INSERT INTO sent_echo_state VALUES(?,?,?,?)",
+                     (scope, int(sent_ids[i]), float(echo[i]), now))
     conn.commit()
 
 

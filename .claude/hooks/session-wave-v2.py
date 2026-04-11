@@ -42,9 +42,10 @@ try:
         audio_phase_accent, visual_phase, wrap_pi, kuramoto_chain,
         tokenize_sent, FUNC_WORDS, PAIR_WINDOW, ETA, ETA_PAIR,
         plasticity_log_scale, ECHO_WEIGHT, ECHO_ENERGY_CAP,
-        load_echo, save_echo,
+        load_echo, save_echo, load_sent_echo, save_sent_echo,
     )
     from wave_phase_core.phase import to_reading_text, _extract_accent, _hl_pattern
+    from wave_phase_core.cli import bipartite_wave
 except ImportError:
     sys.exit(0)
 
@@ -63,7 +64,11 @@ ABRUPT_THRESHOLD = 0.005  # pool activation below this → rebuild
 FRESH_THRESHOLD_MAX = 0.5  # old memories need cos > this to respond
 DEGREE_LEAK_RATE = 0.001   # high-degree nodes saturate faster
 TIMEOUT_SEC = 13
-ECHO_TOPIC_THRESHOLD = 0.1  # cos(echo, current) below this → topic switch → reset echo
+ECHO_TOPIC_THRESHOLD = 0.1         # cos(echo, current) below this → topic switch
+ECHO_BLEND_PREV = 0.7              # normal: prev-echo decay
+ECHO_BLEND_CURRENT = 0.3           # normal: current activation injection
+ECHO_BLEND_PREV_SWITCH = 0.3       # on topic switch: shrink past
+ECHO_BLEND_CURRENT_SWITCH = 0.7    # on topic switch: emphasize current
 # Hybrid learn (phase-precession + gamma-sync analogy)
 SEQ_PULL = 0.40            # sequential x_aud → aud pull weight
 KUR_PULL = 0.10            # kuramoto output → aud pull weight
@@ -685,41 +690,130 @@ def main():
         #     lines = [f"  [{sp}] {t[:50]} ({sc:.1f})" for _, t, sp, sc in top[:3]]
         #     print(f"[session-wave] q={query[:3]}\n" + "\n".join(lines))
 
-    # Update echo: run a quick wave recall with echo to get current activation
+    # Update echo: working-memory bipartite wave on session_sentences only.
+    # Query source = シオの新入力 + クオの直前応答 (cached by stop-log.py).
+    # Both word_act and sent_act are persisted as the new echo.
     if time.time() - t0 < TIMEOUT_SEC - 1:
-        act_with_echo = wave_recall_sparse(query[:4], aud, vis, pairs,
-                                           freshness_weight=True, top_k=50,
-                                           echo_u=echo)
-        # Build current activation vector
-        current_act = np.zeros(len(all_words))
-        for w, z in act_with_echo:
-            if w in word_idx:
-                current_act[word_idx[w]] = z
-        # Also include query words
-        for q in query:
-            if q in word_idx:
-                current_act[word_idx[q]] = 0.5
+        claude_last = ""
+        cache_path = os.path.join(HOME, ".claude", "claude-last-message.txt")
+        try:
+            if os.path.exists(cache_path):
+                with open(cache_path, encoding='utf-8') as f:
+                    claude_last = f.read()[:2000]
+        except Exception:
+            pass
 
-        # Topic switch detection: cos similarity between echo and current
-        echo_norm = np.linalg.norm(echo)
-        current_norm = np.linalg.norm(current_act)
-        if echo_norm > 0.01 and current_norm > 0.01:
-            cos_sim = float(np.dot(echo, current_act) / (echo_norm * current_norm))
-            if cos_sim < ECHO_TOPIC_THRESHOLD:
-                # Topic switched: reset echo to current
-                echo = current_act.copy()
-            else:
-                # Same topic: accumulate (blend old echo with current)
-                echo = echo * 0.7 + current_act * 0.3
-        else:
-            echo = current_act.copy()
+        claude_say = ""
+        say_cache = os.path.join(HOME, ".claude", "claude-last-say.txt")
+        try:
+            if os.path.exists(say_cache):
+                with open(say_cache, encoding='utf-8') as f:
+                    claude_say = f.read()[:1000]
+        except Exception:
+            pass
 
-        # Cap echo energy to prevent saturation
-        echo_l2 = np.linalg.norm(echo)
-        if echo_l2 > ECHO_ENERGY_CAP:
-            echo *= ECHO_ENERGY_CAP / echo_l2
+        combined_text = (prompt or "") + " " + claude_last + " " + claude_say
+        combined_toks = tokenize_sent(combined_text)
+        combined_lemmas = [t['lemma'] for t in combined_toks
+                           if t['lemma'] not in FUNC_WORDS
+                           and len(t['lemma']) >= 2
+                           and t['lemma'] in word_idx]
+        combined_lemmas = list(dict.fromkeys(combined_lemmas))[:12]
 
-        save_echo(conn, echo, all_words)
+        # session_sentences only (no LT) — short-term working memory.
+        # Attach scope='session' so bipartite_wave distinguishes the
+        # sentence namespace from lt_sentences when sent_echo is used.
+        session_sents_raw = conn.execute(
+            "SELECT id, text, lemmas, plasticity FROM session_sentences "
+            "WHERE plasticity > 0.01 ORDER BY id DESC LIMIT 200").fetchall()
+        session_sents = [(r[0], r[1], r[2], r[3] or 1.0, 'session')
+                         for r in session_sents_raw]
+        session_sids = [s[0] for s in session_sents]
+        sent_idx = {sid: i for i, sid in enumerate(session_sids)}
+
+        # Narrow aud/pairs to the lemma subset appearing in this pool —
+        # prevents LT-only vocabulary from dragging the session wave.
+        pool_lemmas = set(combined_lemmas)
+        for _, _, lemmas_str, _, _ in session_sents:
+            if not lemmas_str:
+                continue
+            for l in lemmas_str.split(','):
+                if l and l in aud:
+                    pool_lemmas.add(l)
+        aud_sub = {w: aud[w] for w in pool_lemmas if w in aud}
+        vis_sub = {w: vis[w] for w in pool_lemmas if w in vis}
+        pairs_sub = {(a, b): v for (a, b), v in pairs.items()
+                     if a in pool_lemmas and b in pool_lemmas}
+
+        # Previous sentence echo (working memory persistence, scope='session')
+        prev_sent_echo_vec = load_sent_echo(conn, sent_idx, scope='session')
+        prev_sent_echo = {('session', sid): float(prev_sent_echo_vec[sent_idx[sid]])
+                          for sid in session_sids
+                          if abs(prev_sent_echo_vec[sent_idx[sid]]) > 0.001}
+
+        if combined_lemmas and session_sents:
+            try:
+                word_act, sent_scored, _ = bipartite_wave(
+                    combined_lemmas, aud_sub, vis_sub, pairs_sub, session_sents,
+                    reach_threshold=0.005,
+                    echo_u=None, sent_echo_u=prev_sent_echo)
+
+                # Build new word activation against the *full* word space
+                # (so the saved word echo stays consistent with all_words).
+                current_act = np.zeros(len(all_words))
+                for w, z in word_act.items():
+                    if w in word_idx:
+                        current_act[word_idx[w]] = z
+                for q in combined_lemmas:
+                    if q in word_idx:
+                        current_act[word_idx[q]] = 0.5
+
+                # Topic switch detection: when triggered, shift the blend
+                # ratio toward the current activation so new topics surface
+                # faster (without hard-resetting the echo).
+                topic_switch_detected = False
+                echo_norm = np.linalg.norm(echo)
+                current_norm = np.linalg.norm(current_act)
+                if echo_norm > 0.01 and current_norm > 0.01:
+                    cos_sim_topic = float(np.dot(echo, current_act)
+                                           / (echo_norm * current_norm))
+                    if cos_sim_topic < ECHO_TOPIC_THRESHOLD:
+                        topic_switch_detected = True
+
+                if topic_switch_detected:
+                    blend_prev = ECHO_BLEND_PREV_SWITCH
+                    blend_curr = ECHO_BLEND_CURRENT_SWITCH
+                else:
+                    blend_prev = ECHO_BLEND_PREV
+                    blend_curr = ECHO_BLEND_CURRENT
+
+                # Always-blend (wave superposition with adaptive ratio).
+                echo = echo * blend_prev + current_act * blend_curr
+
+                new_sent_echo_vec = prev_sent_echo_vec * blend_prev
+                for row in sent_scored[:20]:
+                    # sent_scored rows are (sid, text, act, norm_id, si, scope)
+                    sid = row[0]
+                    act = row[2]
+                    if sid in sent_idx:
+                        new_sent_echo_vec[sent_idx[sid]] += float(act) * blend_curr
+
+                # Cap energies
+                echo_l2 = np.linalg.norm(echo)
+                if echo_l2 > ECHO_ENERGY_CAP:
+                    echo *= ECHO_ENERGY_CAP / echo_l2
+                sent_echo_l2 = np.linalg.norm(new_sent_echo_vec)
+                if sent_echo_l2 > ECHO_ENERGY_CAP:
+                    new_sent_echo_vec *= ECHO_ENERGY_CAP / sent_echo_l2
+
+                save_echo(conn, echo, all_words)
+                save_sent_echo(conn, new_sent_echo_vec, session_sids,
+                               scope='session')
+            except Exception as e:
+                import traceback
+                sys.stderr.write(
+                    f"[session-wave-v2] working-memory wave failed: {e}\n"
+                    f"{traceback.format_exc()}\n")
 
     # Memory hint output (uncomment to enable)
     # if pool.get("memory_hint"):
