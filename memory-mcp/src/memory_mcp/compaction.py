@@ -3,15 +3,13 @@
 from __future__ import annotations
 
 import logging
-import re
 import sqlite3
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-# Section markers in MEMORY.md
+# Section marker in MEMORY.md (記憶の核セクションは常に末尾扱い)
 SECTION_START = "## 記憶の核"
-SECTION_END_PATTERN = re.compile(r"^## ", re.MULTILINE)
 
 # Compaction parameters
 # Fresh group: freshness-weighted scoring
@@ -278,21 +276,14 @@ def _update_memory_md(md_path: Path, section_text: str) -> None:
     else:
         content = "# Embodied Claude - Memory\n\n"
 
-    # Find and replace existing section, or append
     section_start_idx = content.find(SECTION_START)
 
     if section_start_idx >= 0:
-        # Find the next ## heading after our section
-        after_section = content[section_start_idx + len(SECTION_START) :]
-        match = SECTION_END_PATTERN.search(after_section)
-        if match:
-            section_end_idx = section_start_idx + len(SECTION_START) + match.start()
-            content = content[:section_start_idx] + section_text + content[section_end_idx:]
-        else:
-            # Our section is the last one
-            content = content[:section_start_idx] + section_text
+        # 記憶の核セクションは常に MEMORY.md の末尾扱い.
+        # 本文中に下位 "## 流れ" 等のヘッダがあると以前は途中で切っていたため
+        # 古い核の続きが堆積するバグがあった. SECTION_START 以降は全置換する.
+        content = content[:section_start_idx] + section_text
     else:
-        # Append new section
         if not content.endswith("\n"):
             content += "\n"
         content += "\n" + section_text
