@@ -263,10 +263,45 @@ def _assemble_laplacian_np(N, i_arr, j_arr, w_arr):
 
 
 # ─────────────────────────────────────────────
+# Specificity: context-entropy continuous weight
+# ─────────────────────────────────────────────
+def _compute_word_specificity(P, W, floor=0.05):
+    """Neighbor weight entropy → specificity per word node.
+
+    Same concept as pred_v30's compute_context_entropy / compute_specificity.
+    High-entropy (function words: の,は,が) → low specificity → dampened.
+    """
+    weight_lists = [[] for _ in range(W)]
+    n = len(P['i'])
+    for k in range(n):
+        w = float(P['count'][k]) * max(float(P['plast'][k]), 0.01)
+        if w <= 0:
+            continue
+        i, j = int(P['i'][k]), int(P['j'][k])
+        if i < W:
+            weight_lists[i].append(w)
+        if j < W:
+            weight_lists[j].append(w)
+    entropy = np.zeros(W)
+    for i in range(W):
+        ws = weight_lists[i]
+        if len(ws) < 2:
+            continue
+        p = np.array(ws)
+        p = p / p.sum()
+        p = p[p > 1e-12]
+        entropy[i] = -float(np.sum(p * np.log(p)))
+    h_max = entropy.max() if entropy.max() > 0 else 1.0
+    spec = floor + (1.0 - floor) * (1.0 - entropy / h_max)
+    return spec
+
+
+# ─────────────────────────────────────────────
 # Phase 1: impulse propagation (hook-compatible)
 # ─────────────────────────────────────────────
 def _impulse_propagate(N, W, L, degree, word_idx, valid_q,
-                       u_echo_word=None, sent_echo_map=None):
+                       u_echo_word=None, sent_echo_map=None,
+                       specificity=None):
     """Sequential impulse injection. Returns x (final activation vector)."""
     leak = 1.0 / (1 + degree * DEGREE_LEAK_RATE)
     u_echo = np.zeros(N)
@@ -282,6 +317,13 @@ def _impulse_propagate(N, W, L, degree, word_idx, valid_q,
     else:
         u_echo = np.zeros(N)
 
+    # Specificity damping: low-spec words (function words) lose energy each step
+    if specificity is not None:
+        spec_damp = np.ones(N)
+        spec_damp[:W] = specificity
+    else:
+        spec_damp = None
+
     x = u_echo * 0.3
     v = np.zeros(N)
     STEPS_PER_INJECT = 4
@@ -292,11 +334,15 @@ def _impulse_propagate(N, W, L, degree, word_idx, valid_q,
             v = v * 0.8 - 0.3 * x * 0.1 + f
             x = np.clip(x + v, -1, 3)
             x *= leak
+            if spec_damp is not None:
+                x *= spec_damp
     for _ in range(8):
         f = -0.3 * (L @ x) + 0.05 * (u_echo - x)
         v = v * 0.8 - 0.3 * x * 0.1 + f
         x = np.clip(x + v, -1, 3)
         x *= leak
+        if spec_damp is not None:
+            x *= spec_damp
     return x
 
 
@@ -334,9 +380,11 @@ def bipartite_wave(query_lemmas, aud, vis, pairs, sents,
             if key in sent_echo_u:
                 sent_echo_map[si] = float(sent_echo_u[key])
 
+    spec = _compute_word_specificity(P, W)
     x = _impulse_propagate(N, W, L, degree, word_idx, valid_q,
                            u_echo_word=echo_u,
-                           sent_echo_map=sent_echo_map)
+                           sent_echo_map=sent_echo_map,
+                           specificity=spec)
 
     word_act = {all_words[i]: float(x[i]) for i in range(W) if x[i] > 0.001}
 
@@ -520,9 +568,11 @@ def _two_phase_recall(query_lemmas, all_words, word_idx, P, sent_cache,
             key = (scope, sid)
             if key in sent_echo_u:
                 sent_echo_map[si] = float(sent_echo_u[key])
+    spec = _compute_word_specificity(P, W)
     x = _impulse_propagate(N, W, L1, degree1, word_idx, valid_q,
                            u_echo_word=echo_u,
-                           sent_echo_map=sent_echo_map)
+                           sent_echo_map=sent_echo_map,
+                           specificity=spec)
 
     lt_hits = []
     for si in range(S):
